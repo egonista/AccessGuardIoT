@@ -1,7 +1,32 @@
+import java.security.MessageDigest
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+fun cargarClaveAesDesdeConfig(): String {
+    val secretsFile = rootProject.file("secrets.properties")
+    val props = Properties()
+    if (secretsFile.exists()) {
+        secretsFile.inputStream().use { props.load(it) }
+    }
+    val desdeArchivo = props.getProperty("ACCESSGUARD_AES_KEY")?.trim()
+    val desdeEnv = System.getenv("ACCESSGUARD_AES_KEY")?.trim()
+    val candidata = desdeArchivo?.takeIf { it.isNotEmpty() } ?: desdeEnv?.takeIf { it.isNotEmpty() }
+    if (candidata != null) {
+        return candidata.take(16).padEnd(16, '0')
+    }
+    logger.warn("secrets.properties no encontrado; usando clave temporal local de compilación. Ver secrets.properties.example.")
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest(rootProject.projectDir.absolutePath.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it) }.take(16)
+}
+
+val claveAesBuild: String = cargarClaveAesDesdeConfig()
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 
 android {
     namespace = "com.example.accessguardiot"
@@ -17,6 +42,7 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "AES_KEY", "\"$claveAesBuild\"")
     }
 
     buildTypes {
@@ -33,6 +59,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

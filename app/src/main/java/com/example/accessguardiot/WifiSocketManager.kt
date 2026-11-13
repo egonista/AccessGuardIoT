@@ -45,7 +45,10 @@ data class EstadoSincronizadoIoT(
     val operadoresRegistrados: List<UsuarioOperador> = emptyList(),
     val timestampOperadores: Long = 0L,
     val claveSupervisor: String = "",
-    val tramaCifradaAES: String = ""
+    val tramaCifradaAES: String = "",
+    val codigoAuthHash: String = "",
+    val codigoAuthCifrado: String = "",
+    val timestampCodigoAuth: Long = 0L
 )
 
 /**
@@ -157,7 +160,7 @@ class WifiSocketManager(context: Context? = null) {
                     bind(InetSocketAddress(PUERTO_IOT))
                 }
                 withContext(Dispatchers.Main) {
-                    onEstadoConexion("Escuchando en puerto $PUERTO_IOT (Listo para recibir o conectar)")
+                    onEstadoConexion("Servicio activo, en espera de enlace")
                 }
 
                 while (isActive) {
@@ -168,7 +171,7 @@ class WifiSocketManager(context: Context? = null) {
             } catch (e: Exception) {
                 if (isActive) {
                     withContext(Dispatchers.Main) {
-                        onEstadoConexion("Aviso Servidor Socket: ${e.localizedMessage ?: "Detenido"}")
+                        onEstadoConexion("Aviso de red: ${e.localizedMessage ?: "Servicio detenido"}")
                     }
                 }
             }
@@ -209,7 +212,7 @@ class WifiSocketManager(context: Context? = null) {
         val ipLimpia = ipDestino.trim()
         val ipPropia = obtenerIpLocal()
         if (ipLimpia.isBlank() || ipLimpia == ipPropia) {
-            onResultado("Ingresa la IP del otro dispositivo (tu IP local es $ipPropia)", "")
+            onResultado("Ingresa la dirección IP del otro dispositivo", "")
             return
         }
 
@@ -221,8 +224,8 @@ class WifiSocketManager(context: Context? = null) {
                 try {
                     withContext(Dispatchers.Main) {
                         onResultado(
-                            if (intento == 1) "Conectando canal bidireccional con $ipLimpia:$PUERTO_IOT..."
-                            else "Reintentando conexión con $ipLimpia (Intento $intento/$maxIntentos)...",
+                            if (intento == 1) "Conectando con $ipLimpia..."
+                            else "Reintentando enlace con $ipLimpia ($intento/$maxIntentos)...",
                             ""
                         )
                     }
@@ -239,7 +242,7 @@ class WifiSocketManager(context: Context? = null) {
                                 conectado = true
                                 withContext(Dispatchers.Main) {
                                     onResultado(
-                                        "Canal bidireccional activo: SQLite sincronizado con $ipLimpia",
+                                        "Enlace activo y sincronizado con $ipLimpia",
                                         trama
                                     )
                                 }
@@ -259,7 +262,7 @@ class WifiSocketManager(context: Context? = null) {
                     conectado = true
                     withContext(Dispatchers.Main) {
                         onResultado(
-                            "Conectado bidireccionalmente con $ipLimpia:$PUERTO_IOT (Sincronizado)",
+                            "Enlace establecido y sincronizado con $ipLimpia",
                             tramaEnviada
                         )
                     }
@@ -274,7 +277,7 @@ class WifiSocketManager(context: Context? = null) {
             if (!conectado) {
                 withContext(Dispatchers.Main) {
                     onResultado(
-                        "No se pudo conectar a $ipLimpia:$PUERTO_IOT tras $maxIntentos intentos",
+                        "No se pudo conectar con $ipLimpia tras $maxIntentos intentos",
                         ""
                     )
                 }
@@ -320,8 +323,8 @@ class WifiSocketManager(context: Context? = null) {
             lectorClienteJob = scope.launch {
                 withContext(Dispatchers.Main) {
                     callbackEstadoConexion?.invoke(
-                        if (esLadoServidor) "Canal bidireccional establecido con cliente ($ipRemota)"
-                        else "Canal bidireccional activo con $ipRemota:$PUERTO_IOT"
+                        if (esLadoServidor) "Enlace establecido con dispositivo ($ipRemota)"
+                        else "Enlace activo con $ipRemota"
                     )
                 }
 
@@ -348,7 +351,7 @@ class WifiSocketManager(context: Context? = null) {
                                 }
                                 withContext(Dispatchers.Main) {
                                     callbackEstadoConexion?.invoke(
-                                        "Sincronizado en vivo (Canal bidireccional con $ipRemota)"
+                                        "Sincronizado en tiempo real ($ipRemota)"
                                     )
                                     callbackMensajeRecibido?.invoke(estadoRecibido, ipRemota)
                                 }
@@ -366,7 +369,7 @@ class WifiSocketManager(context: Context? = null) {
                         notificarEnlace(false, null)
                         withContext(Dispatchers.Main) {
                             callbackEstadoConexion?.invoke(
-                                "Canal con $ipRemota desconectado (Reconectando automáticamente en puerto $PUERTO_IOT)"
+                                "Enlace interrumpido. Reconectando automáticamente..."
                             )
                         }
                     }
@@ -807,7 +810,7 @@ class WifiSocketManager(context: Context? = null) {
                         val ipRemota = socketActual.inetAddress?.hostAddress ?: ipDestino
                         withContext(Dispatchers.Main) {
                             onEstadoEnvio(
-                                "Sincronizado por canal activo ($ipRemota)",
+                                "Sincronizado en tiempo real ($ipRemota)",
                                 tramaCifrada
                             )
                         }
@@ -823,7 +826,7 @@ class WifiSocketManager(context: Context? = null) {
             if (ipLimpia.isBlank() || ipLimpia == ipPropia) {
                 withContext(Dispatchers.Main) {
                     onEstadoEnvio(
-                        "Guardado en SQLite (Esperando conexión del otro dispositivo en puerto $PUERTO_IOT)",
+                        "Guardado localmente (En espera de conexión)",
                         tramaCifrada
                     )
                 }
@@ -838,7 +841,7 @@ class WifiSocketManager(context: Context? = null) {
                     if (intento > 1) {
                         withContext(Dispatchers.Main) {
                             onEstadoEnvio(
-                                "Reintentando conexión con $ipLimpia (Intento $intento/$maxIntentos)...",
+                                "Reintentando enlace con $ipLimpia ($intento/$maxIntentos)...",
                                 tramaCifrada
                             )
                         }
@@ -853,7 +856,7 @@ class WifiSocketManager(context: Context? = null) {
                     enviado = true
                     withContext(Dispatchers.Main) {
                         onEstadoEnvio(
-                            "Conectado y enviado a $ipLimpia:$PUERTO_IOT",
+                            "Conectado y sincronizado con $ipLimpia",
                             tramaCifrada
                         )
                     }
@@ -868,7 +871,7 @@ class WifiSocketManager(context: Context? = null) {
             if (!enviado) {
                 withContext(Dispatchers.Main) {
                     onEstadoEnvio(
-                        "Sin conexión con $ipLimpia (Guardado en SQLite; se sincronizará al reconectar)",
+                        "Sin enlace con $ipLimpia (Se sincronizará automáticamente al reconectar)",
                         tramaCifrada
                     )
                 }
@@ -907,7 +910,10 @@ class WifiSocketManager(context: Context? = null) {
             historialTexto,
             operadoresTexto,
             estado.timestampOperadores.toString(),
-            estado.claveSupervisor.replace("|", "")
+            estado.claveSupervisor.replace("|", ""),
+            estado.codigoAuthHash.replace("|", ""),
+            estado.codigoAuthCifrado.replace("|", ""),
+            estado.timestampCodigoAuth.toString()
         ).joinToString("|")
 
         return SecurityUtils.cifrarAES(tramaPlana)
@@ -927,6 +933,9 @@ class WifiSocketManager(context: Context? = null) {
         val operadoresRaw = partes.getOrNull(11) ?: ""
         val timestampOperadores = partes.getOrNull(12)?.toLongOrNull() ?: 0L
         val claveSupervisor = partes.getOrNull(13) ?: ""
+        val codigoAuthHash = partes.getOrNull(14) ?: ""
+        val codigoAuthCifrado = partes.getOrNull(15) ?: ""
+        val timestampCodigoAuth = partes.getOrNull(16)?.toLongOrNull() ?: 0L
 
         val listaHistorial = if (historialRaw.isBlank()) {
             emptyList()
@@ -973,7 +982,10 @@ class WifiSocketManager(context: Context? = null) {
             operadoresRegistrados = listaOperadores,
             timestampOperadores = timestampOperadores,
             claveSupervisor = claveSupervisor,
-            tramaCifradaAES = lineaCifrada
+            tramaCifradaAES = lineaCifrada,
+            codigoAuthHash = codigoAuthHash,
+            codigoAuthCifrado = codigoAuthCifrado,
+            timestampCodigoAuth = timestampCodigoAuth
         )
     }
 
