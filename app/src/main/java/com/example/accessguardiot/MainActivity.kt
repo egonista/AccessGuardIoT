@@ -11,15 +11,21 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -44,17 +50,25 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.accessguardiot.ui.theme.AccessGuardIoTTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
@@ -78,7 +92,10 @@ class MainActivity : ComponentActivity() {
                     AccessGuardApp(
                         dbHelper = dbHelper,
                         wifiManager = wifiManager,
-                        modifier = Modifier.padding(innerPadding)
+                        modifier = Modifier
+                            .padding(innerPadding)
+                            .consumeWindowInsets(innerPadding)
+                            .imePadding()
                     )
                 }
             }
@@ -89,6 +106,25 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         wifiManager.detenerServidor()
     }
+}
+
+/**
+ * Desplaza suavemente el campo enfocado para que no quede cubierto al animarse el teclado en pantalla.
+ */
+@Composable
+private fun rememberScrollAlEnfocarModifier(): Modifier {
+    val requester = remember { BringIntoViewRequester() }
+    val scope = rememberCoroutineScope()
+    return Modifier
+        .bringIntoViewRequester(requester)
+        .onFocusEvent { state ->
+            if (state.isFocused) {
+                scope.launch {
+                    delay(220)
+                    requester.bringIntoView()
+                }
+            }
+        }
 }
 
 @Composable
@@ -272,6 +308,20 @@ fun AccessGuardApp(
                 enlaceActivo = conectado
                 ipEnlazada = ipRemota
                 ipLocal = wifiManager.obtenerIpLocal()
+                if (conectado && !ipRemota.isNullOrBlank() && ipRemota != ipDestino) {
+                    ipDestino = ipRemota
+                    dbHelper.guardarEstadoPanel(
+                        puertaAbierta = puertaAbierta,
+                        anguloServo = anguloServo,
+                        buzzerActivo = buzzerActivo,
+                        modoAcceso = modoAcceso,
+                        uidRfid = uidRfid,
+                        pinBotonera = pinBotonera,
+                        timestampModificacion = timestampModificacion,
+                        ultimaIp = ipRemota,
+                        timestampOperadores = timestampOperadores
+                    )
+                }
             }
         )
     }
@@ -622,6 +672,15 @@ fun LoginScreen(
     var intentosFallidos by rememberSaveable { mutableIntStateOf(0) }
     var segundosBloqueo by rememberSaveable { mutableIntStateOf(0) }
 
+    val scrollState = rememberScrollState()
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val ocultarTeclado = {
+        focusManager.clearFocus()
+        keyboardController?.hide()
+        Unit
+    }
+
     LaunchedEffect(segundosBloqueo) {
         if (segundosBloqueo > 0) {
             delay(1000)
@@ -633,11 +692,18 @@ fun LoginScreen(
         }
     }
 
+    LaunchedEffect(mostrarRespaldoRed) {
+        if (mostrarRespaldoRed) {
+            delay(80)
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(20.dp),
+            .verticalScroll(scrollState)
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -646,7 +712,7 @@ fun LoginScreen(
             ipEnlazada = ipEnlazada,
             mostrarDetalleTecnico = false
         )
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -682,153 +748,168 @@ fun LoginScreen(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(18.dp))
-
-                if (avisoSesionRevocada != null) {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
-                        border = BorderStroke(1.dp, Color(0xFFD32F2F)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = "🔒 $avisoSesionRevocada",
-                            color = Color(0xFFB71C1C),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(12.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                }
-
-                OutlinedTextField(
-                    value = usuario,
-                    onValueChange = {
-                        usuario = it
-                        if (avisoSesionRevocada != null) onLimpiarAvisoSesion()
-                    },
-                    label = { Text("Usuario") },
-                    singleLine = true,
-                    enabled = segundosBloqueo == 0,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = { Text("Contraseña") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    enabled = segundosBloqueo == 0,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Alerta Roja de Seguridad ISO/IEC 27400 o Error de Credenciales
-                if (mensajeError != null) {
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (esAlertaIso) Color(0xFFFFEBEE) else Color(0xFFFFF3E0)
+                if (!mostrarRecuperacion) {
+                    if (avisoSesionRevocada != null) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
+                            border = BorderStroke(1.dp, Color(0xFFD32F2F)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "🔒 $avisoSesionRevocada",
+                                color = Color(0xFFB71C1C),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+
+                    OutlinedTextField(
+                        value = usuario,
+                        onValueChange = {
+                            usuario = it
+                            if (avisoSesionRevocada != null) onLimpiarAvisoSesion()
+                        },
+                        label = { Text("Usuario") },
+                        singleLine = true,
+                        enabled = segundosBloqueo == 0,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Text,
+                            imeAction = ImeAction.Next
                         ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(rememberScrollAlEnfocarModifier())
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text("Contraseña") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        enabled = segundosBloqueo == 0,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onDone = { ocultarTeclado() }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(rememberScrollAlEnfocarModifier())
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Alerta Roja de Seguridad ISO/IEC 27400 o Error de Credenciales
+                    if (mensajeError != null) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (esAlertaIso) Color(0xFFFFEBEE) else Color(0xFFFFF3E0)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = mensajeError!!,
+                                color = if (esAlertaIso) Color(0xFFB71C1C) else Color(0xFFE65100),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+
+                    Button(
+                        onClick = {
+                            ocultarTeclado()
+                            // 1. Validar Norma ISO/IEC 27400 (Prohibición de credenciales por defecto)
+                            val credencialCombinada = "${usuario.trim()}/${password.trim()}"
+                            if (SecurityUtils.esCredencialProhibida(usuario) ||
+                                SecurityUtils.esCredencialProhibida(password) ||
+                                SecurityUtils.esCredencialProhibida(credencialCombinada)
+                            ) {
+                                esAlertaIso = true
+                                intentosFallidos++
+                                val userLog = usuario.trim().ifBlank { "sin usuario" }
+                                dbHelper.insertarEvento(
+                                    "SEGURIDAD",
+                                    "Intento bloqueado por uso de credencial restringida ($userLog)"
+                                )
+                                if (intentosFallidos >= 3) {
+                                    segundosBloqueo = 15
+                                    mensajeError = "Acceso bloqueado temporalmente (15s) tras 3 intentos fallidos."
+                                } else {
+                                    mensajeError = "Acceso denegado: credencial restringida por política de seguridad. Intento $intentosFallidos de 3."
+                                }
+                                return@Button
+                            }
+
+                            // 2. Validar contra la tabla usuarios en SQLite obteniendo rol y nombre exacto
+                            val auth = dbHelper.validarUsuarioConNombre(usuario, password)
+                            if (auth != null) {
+                                intentosFallidos = 0
+                                mensajeError = null
+                                onLimpiarAvisoSesion()
+                                onLoginExitoso(auth.first, auth.second)
+                            } else {
+                                esAlertaIso = false
+                                intentosFallidos++
+                                if (intentosFallidos >= 3) {
+                                    segundosBloqueo = 15
+                                    dbHelper.insertarEvento(
+                                        "SEGURIDAD",
+                                        "Acceso bloqueado temporalmente tras 3 intentos fallidos"
+                                    )
+                                    mensajeError = "Acceso bloqueado por 15 segundos tras 3 intentos fallidos."
+                                } else {
+                                    mensajeError = "Usuario o contraseña incorrectos. Intento $intentosFallidos de 3."
+                                }
+                            }
+                        },
+                        enabled = segundosBloqueo == 0,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = mensajeError!!,
-                            color = if (esAlertaIso) Color(0xFFB71C1C) else Color(0xFFE65100),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(12.dp)
+                            if (segundosBloqueo > 0) "Bloqueado temporalmente (${segundosBloqueo}s)"
+                            else "Iniciar Sesión"
                         )
                     }
-                    Spacer(modifier = Modifier.height(12.dp))
-                }
 
-                Button(
-                    onClick = {
-                        // 1. Validar Norma ISO/IEC 27400 (Prohibición de credenciales por defecto)
-                        val credencialCombinada = "${usuario.trim()}/${password.trim()}"
-                        if (SecurityUtils.esCredencialProhibida(usuario) ||
-                            SecurityUtils.esCredencialProhibida(password) ||
-                            SecurityUtils.esCredencialProhibida(credencialCombinada)
-                        ) {
-                            esAlertaIso = true
-                            intentosFallidos++
-                            val userLog = usuario.trim().ifBlank { "sin usuario" }
-                            dbHelper.insertarEvento(
-                                "SEGURIDAD",
-                                "Intento bloqueado por uso de credencial restringida ($userLog)"
-                            )
-                            if (intentosFallidos >= 3) {
-                                segundosBloqueo = 15
-                                mensajeError = "Acceso bloqueado temporalmente (15s) tras 3 intentos fallidos."
-                            } else {
-                                mensajeError = "Acceso denegado: credencial restringida por política de seguridad. Intento $intentosFallidos de 3."
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    TextButton(
+                        onClick = {
+                            ocultarTeclado()
+                            mostrarRecuperacion = true
+                            if (usuarioRecuperar.isBlank() && usuario.isNotBlank()) {
+                                usuarioRecuperar = usuario.trim()
                             }
-                            return@Button
-                        }
-
-                        // 2. Validar contra la tabla usuarios en SQLite obteniendo rol y nombre exacto
-                        val auth = dbHelper.validarUsuarioConNombre(usuario, password)
-                        if (auth != null) {
-                            intentosFallidos = 0
-                            mensajeError = null
-                            onLimpiarAvisoSesion()
-                            onLoginExitoso(auth.first, auth.second)
-                        } else {
-                            esAlertaIso = false
-                            intentosFallidos++
-                            if (intentosFallidos >= 3) {
-                                segundosBloqueo = 15
-                                dbHelper.insertarEvento(
-                                    "SEGURIDAD",
-                                    "Acceso bloqueado temporalmente tras 3 intentos fallidos"
-                                )
-                                mensajeError = "Acceso bloqueado por 15 segundos tras 3 intentos fallidos."
-                            } else {
-                                mensajeError = "Usuario o contraseña incorrectos. Intento $intentosFallidos de 3."
-                            }
-                        }
-                    },
-                    enabled = segundosBloqueo == 0,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        if (segundosBloqueo > 0) "Bloqueado temporalmente (${segundosBloqueo}s)"
-                        else "Iniciar Sesión"
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                TextButton(
-                    onClick = {
-                        mostrarRecuperacion = !mostrarRecuperacion
-                        if (mostrarRecuperacion && usuarioRecuperar.isBlank() && usuario.isNotBlank()) {
-                            usuarioRecuperar = usuario.trim()
-                        }
-                        if (!mostrarRecuperacion) {
                             mensajeRecuperacion = null
                         }
+                    ) {
+                        Text(
+                            text = "¿Olvidaste tu contraseña? / Restablecer Contraseña",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-                ) {
-                    Text(
-                        text = if (mostrarRecuperacion) "Ocultar Restablecimiento de Contraseña"
-                        else "¿Olvidaste tu contraseña? / Restablecer Contraseña",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-
-                if (mostrarRecuperacion) {
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
+                } else {
                     Text(
                         text = "Restablecer Contraseña",
                         fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
+                        fontSize = 15.sp,
                         color = MaterialTheme.colorScheme.primary
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -838,7 +919,16 @@ fun LoginScreen(
                         onValueChange = { usuarioRecuperar = it },
                         label = { Text("Usuario") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Text,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(rememberScrollAlEnfocarModifier())
                     )
 
                     Spacer(modifier = Modifier.height(8.dp))
@@ -849,7 +939,16 @@ fun LoginScreen(
                         label = { Text("Código de Autorización") },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Next
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onNext = { focusManager.moveFocus(FocusDirection.Down) }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(rememberScrollAlEnfocarModifier())
                     )
 
                     Spacer(modifier = Modifier.height(8.dp))
@@ -860,7 +959,16 @@ fun LoginScreen(
                         label = { Text("Nueva Contraseña") },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onDone = { ocultarTeclado() }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(rememberScrollAlEnfocarModifier())
                     )
 
                     Spacer(modifier = Modifier.height(6.dp))
@@ -892,6 +1000,7 @@ fun LoginScreen(
 
                     Button(
                         onClick = {
+                            ocultarTeclado()
                             val (exito, mensaje) = onRestablecerPassword(
                                 usuarioRecuperar,
                                 codigoAutorizacion,
@@ -912,6 +1021,22 @@ fun LoginScreen(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Actualizar Contraseña")
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    TextButton(
+                        onClick = {
+                            ocultarTeclado()
+                            mostrarRecuperacion = false
+                            mensajeRecuperacion = null
+                        }
+                    ) {
+                        Text(
+                            text = "← Volver a Iniciar Sesión",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                 }
             }
@@ -974,9 +1099,21 @@ fun LoginScreen(
                             onValueChange = onIpDestinoChange,
                             label = { Text("IP del servidor / Supervisor") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f)
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = { ocultarTeclado() }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .then(rememberScrollAlEnfocarModifier())
                         )
-                        Button(onClick = onConectarYSincronizar) {
+                        Button(onClick = {
+                            ocultarTeclado()
+                            onConectarYSincronizar()
+                        }) {
                             Text("Conectar", fontSize = 12.sp)
                         }
                     }
@@ -989,6 +1126,7 @@ fun LoginScreen(
                     )
                 }
             }
+            Spacer(modifier = Modifier.height(12.dp))
         }
     }
 }
@@ -1063,6 +1201,14 @@ fun DashboardScreen(
     var passSupConfirmar by remember { mutableStateOf("") }
     var mensajePassSup by remember { mutableStateOf<String?>(null) }
     var passSupOk by remember { mutableStateOf(false) }
+
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val ocultarTeclado = {
+        focusManager.clearFocus()
+        keyboardController?.hide()
+        Unit
+    }
 
     Column(
         modifier = modifier
@@ -1193,9 +1339,21 @@ fun DashboardScreen(
                             onValueChange = onIpDestinoChange,
                             label = { Text("IP del dispositivo destino") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f)
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = { ocultarTeclado() }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .then(rememberScrollAlEnfocarModifier())
                         )
-                        Button(onClick = onConectarYSincronizar) {
+                        Button(onClick = {
+                            ocultarTeclado()
+                            onConectarYSincronizar()
+                        }) {
                             Text("Conectar", fontSize = 11.sp)
                         }
                     }
@@ -1518,14 +1676,32 @@ fun DashboardScreen(
                             onValueChange = { campoUid = it },
                             label = { Text("UID Tarjeta RFID") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f)
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Next
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onNext = { focusManager.moveFocus(FocusDirection.Next) }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .then(rememberScrollAlEnfocarModifier())
                         )
                         OutlinedTextField(
                             value = campoPin,
                             onValueChange = { campoPin = it },
                             label = { Text("PIN de Teclado") },
                             singleLine = true,
-                            modifier = Modifier.width(140.dp)
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = { ocultarTeclado() }
+                            ),
+                            modifier = Modifier
+                                .width(140.dp)
+                                .then(rememberScrollAlEnfocarModifier())
                         )
                     }
 
@@ -1543,6 +1719,7 @@ fun DashboardScreen(
 
                     Button(
                         onClick = {
+                            ocultarTeclado()
                             val errorValidacion = SecurityUtils.validarCredencialesAcceso(campoUid, campoPin)
                             if (errorValidacion != null) {
                                 claveActualizadaOk = false
@@ -1675,7 +1852,16 @@ fun DashboardScreen(
                                 label = { Text("Usuario") },
                                 enabled = (usuarioOpEditando == null),
                                 singleLine = true,
-                                modifier = Modifier.weight(1f)
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Text,
+                                    imeAction = ImeAction.Next
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onNext = { focusManager.moveFocus(FocusDirection.Next) }
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .then(rememberScrollAlEnfocarModifier())
                             )
                             OutlinedTextField(
                                 value = nuevaPassOp,
@@ -1685,7 +1871,16 @@ fun DashboardScreen(
                                 },
                                 visualTransformation = PasswordVisualTransformation(),
                                 singleLine = true,
-                                modifier = Modifier.weight(1f)
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Password,
+                                    imeAction = ImeAction.Done
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onDone = { ocultarTeclado() }
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .then(rememberScrollAlEnfocarModifier())
                             )
                         }
 
@@ -1707,6 +1902,7 @@ fun DashboardScreen(
                         ) {
                             Button(
                                 onClick = {
+                                    ocultarTeclado()
                                     val uLimpio = (usuarioOpEditando ?: nuevoUsuarioOp).trim()
                                     val pLimpia = nuevaPassOp.trim()
                                     val errorUsuario = SecurityUtils.validarNuevoOperador(uLimpio, pLimpia)
@@ -1863,7 +2059,16 @@ fun DashboardScreen(
                                 label = { Text("Contraseña actual") },
                                 visualTransformation = PasswordVisualTransformation(),
                                 singleLine = true,
-                                modifier = Modifier.fillMaxWidth()
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Password,
+                                    imeAction = ImeAction.Next
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onNext = { focusManager.moveFocus(FocusDirection.Next) }
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(rememberScrollAlEnfocarModifier())
                             )
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(
@@ -1876,7 +2081,16 @@ fun DashboardScreen(
                                     label = { Text("Nueva contraseña") },
                                     visualTransformation = PasswordVisualTransformation(),
                                     singleLine = true,
-                                    modifier = Modifier.weight(1f)
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Password,
+                                        imeAction = ImeAction.Next
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onNext = { focusManager.moveFocus(FocusDirection.Next) }
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .then(rememberScrollAlEnfocarModifier())
                                 )
                                 OutlinedTextField(
                                     value = passSupConfirmar,
@@ -1884,7 +2098,16 @@ fun DashboardScreen(
                                     label = { Text("Confirmar") },
                                     visualTransformation = PasswordVisualTransformation(),
                                     singleLine = true,
-                                    modifier = Modifier.weight(1f)
+                                    keyboardOptions = KeyboardOptions(
+                                        keyboardType = KeyboardType.Password,
+                                        imeAction = ImeAction.Done
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onDone = { ocultarTeclado() }
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .then(rememberScrollAlEnfocarModifier())
                                 )
                             }
                             if (mensajePassSup != null) {
@@ -1899,6 +2122,7 @@ fun DashboardScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                             Button(
                                 onClick = {
+                                    ocultarTeclado()
                                     if (passSupNueva.trim() != passSupConfirmar.trim()) {
                                         passSupOk = false
                                         mensajePassSup = "Las contraseñas nuevas no coinciden."

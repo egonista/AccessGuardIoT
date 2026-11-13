@@ -1,6 +1,8 @@
 package com.example.accessguardiot
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -29,6 +31,14 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
+private data class InterfazLanLocal(
+    val nombre: String,
+    val direccion: Inet4Address,
+    val ip: String,
+    val broadcast: String?,
+    val prioridad: Int
+)
+
 // Estructura completa que viaja cifrada en AES-128 (Estado + Historial SQLite + Operadores)
 data class EstadoSincronizadoIoT(
     val puertaAbierta: Boolean,
@@ -53,7 +63,7 @@ data class EstadoSincronizadoIoT(
 
 /**
  * Gestor de Socket TCP/IP Bidireccional Persistente sobre Wi-Fi / Hotspot (Puerto 5000)
- * + Autodescubrimiento automático (NsdManager, UDP Broadcast, IPs de Hotspot/Emulador y escaneo de subred).
+ * + Autodescubrimiento automático (NsdManager, UDP Broadcast por interfaz, Gateway del sistema y escaneo de subred).
  */
 class WifiSocketManager(context: Context? = null) {
 
@@ -68,7 +78,11 @@ class WifiSocketManager(context: Context? = null) {
         private val IPS_HOTSPOT_EMULADOR = listOf("192.168.43.1", "192.168.137.1", "10.0.2.2")
 
         // Desempate: la IP menor conecta de inmediato; la mayor espera este tiempo antes de intentar (evita conexiones cruzadas)
-        private const val ESPERA_DESEMPATE_MS = 7000L
+        private const val ESPERA_DESEMPATE_MS = 2500L
+
+        // Tiempos de sondeo rápido en red local Wi-Fi / Hotspot
+        private const val TIMEOUT_CONEXION_AUTO_MS = 500
+        private const val TIMEOUT_ESCANEO_MS = 350
 
         // Si no llega ninguna trama ni latido en este tiempo, se considera el enlace caído y se reconecta
         private const val TIMEOUT_SIN_DATOS_MS = 16000L
@@ -108,6 +122,9 @@ class WifiSocketManager(context: Context? = null) {
 
     @Volatile
     private var ultimaRecepcionMs = 0L
+
+    @Volatile
+    private var inicioConexionActualMs = 0L
 
     @Volatile
     private var ultimaIpExitosa: String? = null
@@ -291,6 +308,25 @@ class WifiSocketManager(context: Context? = null) {
      */
     private fun configurarCanalBidireccional(socket: Socket, esLadoServidor: Boolean) {
         try {
+            val ipRemota = socket.inetAddress?.hostAddress?.removePrefix("::ffff:") ?: "Dispositivo Remoto"
+            val ipPropia = obtenerIpLocal()
+            val actual = socketActivo
+            // Si acabamos de abrir un enlace saliente como iniciador designado (IP menor), descartar el cruce entrante simultáneo
+            if (esLadoServidor &&
+                actual != null &&
+                actual.isConnected &&
+                !actual.isClosed &&
+                actual.inetAddress?.hostAddress?.removePrefix("::ffff:") == ipRemota &&
+                System.currentTimeMillis() - inicioConexionActualMs < 1500L &&
+                compararIp(ipPropia, ipRemota) < 0
+            ) {
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
+                return
+            }
+
             lectorClienteJob?.cancel()
 
             // Se asigna primero el nuevo socket para que el lector anterior no anule el writer nuevo al cerrarse
@@ -299,7 +335,8 @@ class WifiSocketManager(context: Context? = null) {
             socket.tcpNoDelay = true
             socketActivo = socket
             enlaceVerificado = false
-            ultimaRecepcionMs = System.currentTimeMillis()
+            inicioConexionActualMs = System.currentTimeMillis()
+            ultimaRecepcionMs = inicioConexionActualMs
             val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8), true)
             writerActivo = writer
 
@@ -310,7 +347,6 @@ class WifiSocketManager(context: Context? = null) {
                 }
             }
 
-            val ipRemota = socket.inetAddress?.hostAddress ?: "Dispositivo Remoto"
             val verificado = AtomicBoolean(false)
 
             // Al establecer el canal, ambos extremos envían automáticamente su estado actual + historial SQLite + usuarios
@@ -344,9 +380,7 @@ class WifiSocketManager(context: Context? = null) {
                                     enlaceVerificado = true
                                     ipEnlaceActual = ipRemota
                                     ipsNoValidas.remove(ipRemota)
-                                    if (!esLadoServidor) {
-                                        ultimaIpExitosa = ipRemota
-                                    }
+                                    ultimaIpExitosa = ipRemota
                                     notificarEnlace(true, ipRemota)
                                 }
                                 withContext(Dispatchers.Main) {
@@ -428,6 +462,7 @@ class WifiSocketManager(context: Context? = null) {
 
         autoConexionJob = scope.launch {
             var ciclo = 0
+            var ipsAnteriores: Set<String> = emptySet()
             while (isActive) {
                 try {
                     if (estaConectado()) {
@@ -439,39 +474,42 @@ class WifiSocketManager(context: Context? = null) {
                         }
                     } else {
                         notificarEnlace(false, null)
-                        val ipPropia = obtenerIpLocal()
-                        val ipsPropias = obtenerTodasIpsLocales()
+                        val interfacesLan = obtenerInterfacesLanActivas()
+                        val ipPropia = interfacesLan.firstOrNull()?.ip ?: obtenerIpLocal()
+                        val ipsPropias = (interfacesLan.map { it.ip } + obtenerTodasIpsLocales()).toSet()
 
-                        // 1. Anunciarse por UDP Broadcast para que el otro dispositivo nos encuentre
-                        enviarBroadcastUdp(ipPropia)
+                        // Si el usuario activó Zona Wi-Fi o cambió de red con la app abierta, limpiar caché de IPs fallidas
+                        if (ipsAnteriores.isNotEmpty() && ipsPropias != ipsAnteriores) {
+                            ipsNoValidas.clear()
+                        }
+                        ipsAnteriores = ipsPropias
 
-                        // 2. Probar IP preferida, última exitosa, descubiertas (NSD/UDP), Hotspot y Emulador
+                        // 1. Anunciarse por UDP Broadcast directamente sobre cada interfaz Wi-Fi / Hotspot activa
+                        enviarBroadcastUdp(interfacesLan, ipPropia)
+
+                        // 2. Probar en paralelo: descubiertas (NSD/UDP), gateway Hotspot del sistema, .1 de cada subred, historial y emulador
                         val preferida = try {
                             obtenerIpPreferida()
                         } catch (_: Exception) {
                             ""
                         }
-                        for (ip in construirCandidatos(preferida, ipPropia, ipsPropias)) {
-                            if (estaConectado()) break
-                            if (puedeIniciarConexion(ip, ipPropia)) {
-                                intentarConexionAuto(ip, 800)
-                            }
+                        val candidatos = construirCandidatos(preferida, ipPropia, ipsPropias, interfacesLan)
+                        intentarConexionParalela(candidatos, ipPropia)
+
+                        // 3. Escaneo rápido de todas las subredes Wi-Fi / Hotspot activas cada 2 ciclos
+                        if (!estaConectado() && ciclo % 2 == 0) {
+                            escanearSubredesLocales(interfacesLan, ipPropia, ipsPropias)
                         }
 
-                        // 3. Escaneo rápido de la subred local cada 3 ciclos
-                        if (!estaConectado() && ciclo % 3 == 0) {
-                            escanearSubredLocal(ipPropia, ipsPropias)
-                        }
-
-                        // Las IPs descartadas se vuelven a probar cada cierto tiempo
-                        if (ciclo % 20 == 19) {
+                        // Las IPs descartadas se vuelven a habilitar tras pocos ciclos (~10 s)
+                        if (ciclo % 6 == 5) {
                             ipsNoValidas.clear()
                         }
                         ciclo++
                     }
                 } catch (_: Exception) {
                 }
-                delay(if (estaConectado()) 4000L else 3000L)
+                delay(if (estaConectado()) 4000L else 1500L)
             }
         }
     }
@@ -505,13 +543,22 @@ class WifiSocketManager(context: Context? = null) {
         }
     }
 
-    private fun construirCandidatos(ipPreferida: String, ipPropia: String, ipsPropias: Set<String>): List<String> {
+    private fun construirCandidatos(
+        ipPreferida: String,
+        ipPropia: String,
+        ipsPropias: Set<String>,
+        interfacesLan: List<InterfazLanLocal>
+    ): List<String> {
         val lista = LinkedHashSet<String>()
-        ipPreferida.trim().takeIf { it.isNotBlank() }?.let { lista.add(it) }
-        ultimaIpExitosa?.let { lista.add(it) }
         lista.addAll(ipsDescubiertas)
-        lista.addAll(IPS_HOTSPOT_EMULADOR)
+        lista.addAll(obtenerGatewaysDesdeSistema())
+        for (iface in interfacesLan) {
+            prefijoSubred(iface.ip)?.let { lista.add("$it.1") }
+        }
         prefijoSubred(ipPropia)?.let { lista.add("$it.1") }
+        ultimaIpExitosa?.let { lista.add(it) }
+        ipPreferida.trim().takeIf { it.isNotBlank() }?.let { lista.add(it) }
+        lista.addAll(IPS_HOTSPOT_EMULADOR)
         lista.remove("127.0.0.1")
         lista.removeAll(ipsPropias)
         lista.removeAll(ipsNoValidas)
@@ -543,11 +590,56 @@ class WifiSocketManager(context: Context? = null) {
         return valor
     }
 
-    private fun prefijoSubred(ip: String): String? {
+    private fun esIpv4Privada(ip: String): Boolean {
         val partes = ip.split(".")
-        if (partes.size != 4) return null
-        val esPrivada = ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")
-        return if (esPrivada) "${partes[0]}.${partes[1]}.${partes[2]}" else null
+        if (partes.size != 4) return false
+        val p0 = partes[0].toIntOrNull() ?: return false
+        val p1 = partes[1].toIntOrNull() ?: return false
+        return p0 == 10 || (p0 == 192 && p1 == 168) || (p0 == 172 && p1 in 16..31)
+    }
+
+    private fun prefijoSubred(ip: String): String? {
+        if (!esIpv4Privada(ip)) return null
+        val partes = ip.split(".")
+        return "${partes[0]}.${partes[1]}.${partes[2]}"
+    }
+
+    /** Prueba todos los candidatos prioritarios en paralelo (~500 ms totales en lugar de esperar uno por uno). */
+    private suspend fun intentarConexionParalela(candidatos: List<String>, ipPropia: String) {
+        if (candidatos.isEmpty() || estaConectado()) return
+        val filtrados = candidatos.filter { puedeIniciarConexion(it, ipPropia) }
+        if (filtrados.isEmpty()) return
+
+        coroutineScope {
+            val sockets = filtrados.map { ip ->
+                async(Dispatchers.IO) {
+                    if (estaConectado()) return@async null
+                    val s = Socket()
+                    try {
+                        s.connect(InetSocketAddress(ip, PUERTO_IOT), TIMEOUT_CONEXION_AUTO_MS)
+                        s
+                    } catch (_: Exception) {
+                        try {
+                            s.close()
+                        } catch (_: Exception) {
+                        }
+                        null
+                    }
+                }
+            }.awaitAll().filterNotNull()
+
+            var adoptado = false
+            for (s in sockets) {
+                if (adoptado) {
+                    try {
+                        s.close()
+                    } catch (_: Exception) {
+                    }
+                } else {
+                    adoptado = adoptarSocketSiLibre(s)
+                }
+            }
+        }
     }
 
     private fun intentarConexionAuto(ip: String, timeoutMs: Int): Boolean {
@@ -580,44 +672,57 @@ class WifiSocketManager(context: Context? = null) {
         }
     }
 
-    /** Escaneo rápido y paralelo (bloques de 64 hosts, 300 ms) de la subred local en el puerto 5000. */
-    private suspend fun escanearSubredLocal(ipPropia: String, ipsPropias: Set<String>) {
-        val prefijo = prefijoSubred(ipPropia) ?: return
-        val hosts = (1..254).map { "$prefijo.$it" }
-            .filter { it !in ipsPropias && it !in ipsNoValidas }
+    /** Escaneo rápido y paralelo (bloques de 64 hosts, 350 ms) de todas las subredes Wi-Fi/Hotspot activas. */
+    private suspend fun escanearSubredesLocales(
+        interfacesLan: List<InterfazLanLocal>,
+        ipPropia: String,
+        ipsPropias: Set<String>
+    ) {
+        val prefijos = linkedSetOf<String>()
+        for (iface in interfacesLan) {
+            prefijoSubred(iface.ip)?.let { prefijos.add(it) }
+        }
+        prefijoSubred(ipPropia)?.let { prefijos.add(it) }
+        if (prefijos.isEmpty()) return
 
-        coroutineScope {
-            for (bloque in hosts.chunked(64)) {
-                if (estaConectado()) break
-                val encontrados = bloque.map { ip ->
-                    async(Dispatchers.IO) {
-                        if (!puedeIniciarConexion(ip, ipPropia)) return@async null
-                        val s = Socket()
-                        try {
-                            s.connect(InetSocketAddress(ip, PUERTO_IOT), 300)
-                            s
-                        } catch (_: Exception) {
+        for (prefijo in prefijos) {
+            if (estaConectado()) break
+            val hosts = (1..254).map { "$prefijo.$it" }
+                .filter { it !in ipsPropias && it !in ipsNoValidas }
+
+            coroutineScope {
+                for (bloque in hosts.chunked(64)) {
+                    if (estaConectado()) break
+                    val encontrados = bloque.map { ip ->
+                        async(Dispatchers.IO) {
+                            if (estaConectado() || !puedeIniciarConexion(ip, ipPropia)) return@async null
+                            val s = Socket()
+                            try {
+                                s.connect(InetSocketAddress(ip, PUERTO_IOT), TIMEOUT_ESCANEO_MS)
+                                s
+                            } catch (_: Exception) {
+                                try {
+                                    s.close()
+                                } catch (_: Exception) {
+                                }
+                                null
+                            }
+                        }
+                    }.awaitAll().filterNotNull()
+
+                    var adoptado = false
+                    for (s in encontrados) {
+                        if (adoptado) {
                             try {
                                 s.close()
                             } catch (_: Exception) {
                             }
-                            null
+                        } else {
+                            adoptado = adoptarSocketSiLibre(s)
                         }
                     }
-                }.awaitAll().filterNotNull()
-
-                var adoptado = false
-                for (s in encontrados) {
-                    if (adoptado) {
-                        try {
-                            s.close()
-                        } catch (_: Exception) {
-                        }
-                    } else {
-                        adoptado = adoptarSocketSiLibre(s)
-                    }
+                    if (adoptado) break
                 }
-                if (adoptado) break
             }
         }
     }
@@ -630,7 +735,7 @@ class WifiSocketManager(context: Context? = null) {
         if (!estaConectado()) {
             scope.launch {
                 if (!estaConectado() && puedeIniciarConexion(ip, obtenerIpLocal())) {
-                    intentarConexionAuto(ip, 1500)
+                    intentarConexionAuto(ip, 1200)
                 }
             }
         }
@@ -659,7 +764,7 @@ class WifiSocketManager(context: Context? = null) {
                     val token = SecurityUtils.descifrarAES(partes[2]) ?: continue
                     if (!token.startsWith(TOKEN_DESCUBRIMIENTO)) continue
 
-                    val ipOrigen = paquete.address?.hostAddress ?: continue
+                    val ipOrigen = paquete.address?.hostAddress?.removePrefix("::ffff:") ?: continue
                     registrarIpDescubierta(ipOrigen)
                 }
             } catch (_: Exception) {
@@ -667,10 +772,37 @@ class WifiSocketManager(context: Context? = null) {
         }
     }
 
-    private fun enviarBroadcastUdp(ipPropia: String) {
+    private fun enviarBroadcastUdp(interfacesLan: List<InterfazLanLocal>, ipPropia: String) {
         try {
             val token = SecurityUtils.cifrarAES("$TOKEN_DESCUBRIMIENTO|$ipPropia")
             val datos = "$FIRMA_UDP|$PUERTO_IOT|$token".toByteArray(Charsets.UTF_8)
+
+            // 1. Enviar enlazado a cada interfaz Wi-Fi / Hotspot para evitar que Android lo desvíe por datos móviles (4G/5G)
+            for (iface in interfacesLan) {
+                val destinos = linkedSetOf<String>()
+                iface.broadcast?.let { destinos.add(it) }
+                prefijoSubred(iface.ip)?.let { destinos.add("$it.255") }
+                destinos.add("255.255.255.255")
+                try {
+                    DatagramSocket(InetSocketAddress(iface.direccion, 0)).use { s ->
+                        s.broadcast = true
+                        for (destino in destinos) {
+                            try {
+                                s.send(
+                                    DatagramPacket(
+                                        datos, datos.size,
+                                        InetAddress.getByName(destino), PUERTO_DESCUBRIMIENTO_UDP
+                                    )
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            // 2. Respaldo general si no hubo interfaz LAN específica (ej. puente de emulador)
             DatagramSocket().use { s ->
                 s.broadcast = true
                 val destinos = linkedSetOf("255.255.255.255")
@@ -989,20 +1121,103 @@ class WifiSocketManager(context: Context? = null) {
         )
     }
 
-    /**
-     * Recorre todas las interfaces de red (NetworkInterface.getNetworkInterfaces())
-     * detectando la IP real tanto cuando el teléfono comparte Zona Wi-Fi (Hotspot: 192.168.43.x,
-     * 192.168.x.x, etc.) como en Wi-Fi local o Emulador (10.0.2.15).
-     */
-    fun obtenerIpLocal(): String {
-        return try {
-            val candidatas = mutableListOf<Pair<String, String>>() // Pair(nombreInterfaz, ip)
+    /** Obtiene interfaces locales Wi-Fi / Hotspot / Ethernet válidas con su IPv4 privada y dirección broadcast real. */
+    private fun obtenerInterfacesLanActivas(): List<InterfazLanLocal> {
+        val resultado = mutableListOf<InterfazLanLocal>()
+        val prefijosExcluidos = listOf(
+            "rmnet", "ccmni", "pdp", "seth", "epdg", "v4-",
+            "tun", "tap", "ppp", "dummy", "clat", "wwan", "sit", "ip6tnl"
+        )
+        try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
-
             while (interfaces != null && interfaces.hasMoreElements()) {
                 val red = interfaces.nextElement()
                 if (!red.isUp || red.isLoopback) continue
+                val nombre = red.name.lowercase()
+                if (prefijosExcluidos.any { nombre.contains(it) }) continue
 
+                val prioridad = when {
+                    nombre.contains("swlan") || nombre.contains("ap") ||
+                        nombre.contains("softap") || nombre.contains("tether") ||
+                        nombre.contains("rndis") -> 3
+                    nombre.contains("wlan") || nombre.contains("eth") ||
+                        nombre.contains("en") || nombre.contains("bridge") -> 2
+                    else -> 1
+                }
+
+                for (ifAddr in red.interfaceAddresses) {
+                    val addr = ifAddr.address as? Inet4Address ?: continue
+                    if (addr.isLoopbackAddress || addr.isLinkLocalAddress) continue
+                    val ip = addr.hostAddress ?: continue
+                    if (ip == "0.0.0.0" || !esIpv4Privada(ip)) continue
+
+                    val broadcast = ifAddr.broadcast?.hostAddress?.takeIf {
+                        it.isNotBlank() && it != "0.0.0.0"
+                    }
+                    resultado.add(
+                        InterfazLanLocal(
+                            nombre = nombre,
+                            direccion = addr,
+                            ip = ip,
+                            broadcast = broadcast,
+                            prioridad = prioridad
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return resultado.sortedWith(
+            compareByDescending<InterfazLanLocal> { it.prioridad }
+                .thenByDescending { it.ip.startsWith("192.168.") }
+        )
+    }
+
+    /** Consulta al sistema los gateways IPv4 de redes Wi-Fi / Ethernet activas (ideal para detectar Zona Wi-Fi). */
+    @Suppress("DEPRECATION")
+    private fun obtenerGatewaysDesdeSistema(): List<String> {
+        val ctx = appContext ?: return emptyList()
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return emptyList()
+        val gateways = linkedSetOf<String>()
+        try {
+            val redes = linkedSetOf<android.net.Network>()
+            cm.activeNetwork?.let { redes.add(it) }
+            for (net in cm.allNetworks) {
+                redes.add(net)
+            }
+            for (net in redes) {
+                val caps = cm.getNetworkCapabilities(net) ?: continue
+                val esRedLocal = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                if (!esRedLocal) continue
+
+                val linkProps = cm.getLinkProperties(net) ?: continue
+                for (ruta in linkProps.routes) {
+                    val gw = ruta.gateway as? Inet4Address ?: continue
+                    if (gw.isLoopbackAddress) continue
+                    val gwIp = gw.hostAddress ?: continue
+                    if (gwIp != "0.0.0.0" && esIpv4Privada(gwIp)) {
+                        gateways.add(gwIp)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return gateways.toList()
+    }
+
+    /**
+     * Recorre las interfaces de red detectando primero la IP real de Zona Wi-Fi (Hotspot),
+     * Wi-Fi local o Emulador, evitando confundirse con interfaces celulares (rmnet) o VPN.
+     */
+    fun obtenerIpLocal(): String {
+        obtenerInterfacesLanActivas().firstOrNull()?.let { return it.ip }
+        return try {
+            val candidatas = mutableListOf<Pair<String, String>>()
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                val red = interfaces.nextElement()
+                if (!red.isUp || red.isLoopback) continue
                 val nombreRed = red.name.lowercase()
                 val direcciones = red.inetAddresses
                 while (direcciones.hasMoreElements()) {
@@ -1015,25 +1230,12 @@ class WifiSocketManager(context: Context? = null) {
                     }
                 }
             }
-
-            // 1. Priorizar IP de Zona Wi-Fi / Hotspot o LAN local (192.168.x.x)
             candidatas.firstOrNull { it.second.startsWith("192.168.") }?.let { return it.second }
-
-            // 2. Priorizar interfaces de Hotspot/Wi-Fi conocidas (wlan, ap, swlan, rndis, tether, eth)
-            candidatas.firstOrNull { (nombre, _) ->
-                nombre.contains("wlan") || nombre.contains("ap") ||
-                        nombre.contains("swlan") || nombre.contains("tether") ||
-                        nombre.contains("rndis") || nombre.contains("eth")
-            }?.let { return it.second }
-
-            // 3. Priorizar redes privadas 172.x o 10.x (ej. Emulador 10.0.2.15)
             candidatas.firstOrNull {
                 it.second.startsWith("172.") || it.second.startsWith("10.")
             }?.let { return it.second }
-
-            // 4. Cualquier otra IPv4 activa encontrada
             candidatas.firstOrNull()?.second ?: "127.0.0.1"
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             "127.0.0.1"
         }
     }
