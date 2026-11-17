@@ -33,13 +33,17 @@ data class EstadoGuardadoSQLite(
     val timestampModificacion: Long,
     val ultimaIpDestino: String,
     val timestampOperadores: Long = 0L,
-    val timestampCodigoAuth: Long = 0L
+    val timestampCodigoAuth: Long = 0L,
+    val ultimaIpEsp32: String = "192.168.43.50"
 )
 
 /**
  * Base de datos local SQLite nativa (acceso_iot.db)
  */
-class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.db", null, 5) {
+class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.db", null, 6) {
+
+    @Volatile
+    private var tablaPanelLista = false
 
     override fun onCreate(db: SQLiteDatabase) {
         // 1. Tabla de usuarios con roles diferenciados (SUPERVISOR vs OPERADOR) y clave hasheada en SHA-256
@@ -90,6 +94,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
     }
 
     private fun crearTablaEstadoPanel(db: SQLiteDatabase) {
+        if (tablaPanelLista) return
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS estado_panel (
@@ -105,18 +110,23 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
                 timestamp_operadores INTEGER DEFAULT 0,
                 codigo_auth_hash TEXT DEFAULT '',
                 codigo_auth_cifrado TEXT DEFAULT '',
-                timestamp_codigo_auth INTEGER DEFAULT 0
+                timestamp_codigo_auth INTEGER DEFAULT 0,
+                intentos_fallidos_login INTEGER DEFAULT 0,
+                login_bloqueado INTEGER DEFAULT 0,
+                ultima_ip_esp32 TEXT DEFAULT '192.168.43.50'
             )
             """.trimIndent()
         )
         db.execSQL(
             """
             INSERT OR IGNORE INTO estado_panel 
-            (id, puerta_abierta, angulo_servo, buzzer_activo, modo_acceso, uid_rfid, pin_botonera, timestamp_modificacion, ultima_ip, timestamp_operadores)
-            VALUES (1, 0, 0, 0, 'RFID', 'A4-9B-3C-12', '4829', 0, '192.168.43.1', 0)
+            (id, puerta_abierta, angulo_servo, buzzer_activo, modo_acceso, uid_rfid, pin_botonera, timestamp_modificacion, ultima_ip, timestamp_operadores, ultima_ip_esp32)
+            VALUES (1, 0, 0, 0, 'RFID', 'A4-9B-3C-12', '4829', 0, '192.168.43.1', 0, '192.168.43.50')
             """.trimIndent()
         )
         asegurarCodigoAutorizacion(db)
+        migrarSecretosAKeystore(db)
+        tablaPanelLista = true
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -145,6 +155,83 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
             }
             asegurarCodigoAutorizacion(db)
         }
+        if (oldVersion < 6) {
+            for (stmt in listOf(
+                "ALTER TABLE estado_panel ADD COLUMN intentos_fallidos_login INTEGER DEFAULT 0",
+                "ALTER TABLE estado_panel ADD COLUMN login_bloqueado INTEGER DEFAULT 0",
+                "ALTER TABLE estado_panel ADD COLUMN ultima_ip_esp32 TEXT DEFAULT '192.168.43.50'"
+            )) {
+                try {
+                    db.execSQL(stmt)
+                } catch (_: Exception) {
+                }
+            }
+            migrarSecretosAKeystore(db)
+        }
+    }
+
+    private fun cifrarCodigoAuthLocal(llavePlana: String): String {
+        val limpio = llavePlana.trim()
+        return KeystoreHelper.cifrarLocal(limpio) ?: SecurityUtils.cifrarAES(limpio)
+    }
+
+    private fun descifrarCodigoAuthLocal(valorGuardado: String): String? {
+        val limpio = valorGuardado.trim()
+        if (limpio.isEmpty()) return null
+        return if (KeystoreHelper.esValorSellado(limpio)) {
+            KeystoreHelper.descifrarLocal(limpio)
+        } else {
+            SecurityUtils.descifrarAES(limpio)
+        }
+    }
+
+    private fun cifrarCredencialPanelLocal(valorPlano: String): String {
+        val limpio = valorPlano.trim()
+        if (limpio.isEmpty()) return ""
+        return KeystoreHelper.cifrarLocal(limpio) ?: limpio
+    }
+
+    private fun descifrarCredencialPanelLocal(valorGuardado: String, defecto: String): String {
+        val limpio = valorGuardado.trim()
+        if (limpio.isEmpty()) return defecto
+        return if (KeystoreHelper.esValorSellado(limpio)) {
+            KeystoreHelper.descifrarLocal(limpio) ?: defecto
+        } else {
+            limpio
+        }
+    }
+
+    /** Sella con Android Keystore credenciales locales y llave de recuperación guardadas en SQLite. */
+    private fun migrarSecretosAKeystore(db: SQLiteDatabase) {
+        val cursor = db.rawQuery(
+            "SELECT uid_rfid, pin_botonera, codigo_auth_cifrado FROM estado_panel WHERE id = 1",
+            null
+        )
+        var uidActual = ""
+        var pinActual = ""
+        var authActual = ""
+        if (cursor.moveToFirst()) {
+            uidActual = cursor.getString(0) ?: ""
+            pinActual = cursor.getString(1) ?: ""
+            authActual = cursor.getString(2) ?: ""
+        }
+        cursor.close()
+
+        val valores = ContentValues()
+        if (uidActual.isNotBlank() && !KeystoreHelper.esValorSellado(uidActual)) {
+            KeystoreHelper.cifrarLocal(uidActual)?.let { valores.put("uid_rfid", it) }
+        }
+        if (pinActual.isNotBlank() && !KeystoreHelper.esValorSellado(pinActual)) {
+            KeystoreHelper.cifrarLocal(pinActual)?.let { valores.put("pin_botonera", it) }
+        }
+        if (authActual.isNotBlank() && !KeystoreHelper.esValorSellado(authActual)) {
+            SecurityUtils.descifrarAES(authActual)?.let { plano ->
+                KeystoreHelper.cifrarLocal(plano)?.let { valores.put("codigo_auth_cifrado", it) }
+            }
+        }
+        if (valores.size() > 0) {
+            db.update("estado_panel", valores, "id = 1", null)
+        }
     }
 
     private fun asegurarCodigoAutorizacion(db: SQLiteDatabase) {
@@ -160,12 +247,12 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
         }
         cursor.close()
 
-        val cifradoLegible = SecurityUtils.descifrarAES(cifradoActual)
+        val cifradoLegible = descifrarCodigoAuthLocal(cifradoActual)
         if (!SecurityUtils.esHashSha256(hashActual) || cifradoLegible.isNullOrBlank()) {
             val nuevaLlave = SecurityUtils.generarCodigoAutorizacionAleatorio()
             val valores = ContentValues().apply {
                 put("codigo_auth_hash", SecurityUtils.hashCodigoAutorizacion(nuevaLlave))
-                put("codigo_auth_cifrado", SecurityUtils.cifrarAES(nuevaLlave))
+                put("codigo_auth_cifrado", cifrarCodigoAuthLocal(nuevaLlave))
                 put("timestamp_codigo_auth", 1L)
             }
             db.update("estado_panel", valores, "id = 1", null)
@@ -392,17 +479,17 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
             cifrado = cursor.getString(0) ?: ""
         }
         cursor.close()
-        val plano = SecurityUtils.descifrarAES(cifrado)
+        val plano = descifrarCodigoAuthLocal(cifrado)
         return if (!plano.isNullOrBlank()) plano else rotarCodigoAutorizacion()
     }
 
-    /** Genera y guarda una nueva Llave de Recuperación aleatoria con su hash SHA-256. */
+    /** Genera y guarda una nueva Llave de Recuperación aleatoria con su hash SHA-256 y resguardo en Keystore. */
     fun rotarCodigoAutorizacion(): String {
         val db = writableDatabase
         crearTablaEstadoPanel(db)
         val nuevaLlave = SecurityUtils.generarCodigoAutorizacionAleatorio()
         val nuevoHash = SecurityUtils.hashCodigoAutorizacion(nuevaLlave)
-        val nuevoCifrado = SecurityUtils.cifrarAES(nuevaLlave)
+        val nuevoCifrado = cifrarCodigoAuthLocal(nuevaLlave)
         val ahora = System.currentTimeMillis()
         val valores = ContentValues().apply {
             put("codigo_auth_hash", nuevoHash)
@@ -413,7 +500,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
         return nuevaLlave
     }
 
-    /** Devuelve (hash, cifrado, timestamp) de la Llave de Recuperación para sincronización cifrada entre dispositivos. */
+    /** Devuelve (hash, cifrado de transporte P2P, timestamp) de la Llave de Recuperación para sincronizar. */
     fun obtenerDatosSyncCodigoAuth(): Triple<String, String, Long> {
         val db = writableDatabase
         crearTablaEstadoPanel(db)
@@ -421,26 +508,30 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
             "SELECT codigo_auth_hash, codigo_auth_cifrado, timestamp_codigo_auth FROM estado_panel WHERE id = 1",
             null
         )
-        var triple = Triple("", "", 0L)
+        var hash = ""
+        var cifradoLocal = ""
+        var timestamp = 0L
         if (cursor.moveToFirst()) {
-            triple = Triple(
-                cursor.getString(0) ?: "",
-                cursor.getString(1) ?: "",
-                cursor.getLong(2)
-            )
+            hash = cursor.getString(0) ?: ""
+            cifradoLocal = cursor.getString(1) ?: ""
+            timestamp = cursor.getLong(2)
         }
         cursor.close()
-        return triple
+        val plano = descifrarCodigoAuthLocal(cifradoLocal)
+        val cifradoTransporte = if (!plano.isNullOrBlank()) SecurityUtils.cifrarAES(plano) else ""
+        return Triple(hash, cifradoTransporte, timestamp)
     }
 
-    /** Aplica una Llave de Recuperación sincronizada desde el otro terminal. */
+    /** Aplica una Llave de Recuperación sincronizada desde el otro terminal y la sella en Android Keystore. */
     fun sincronizarCodigoAuth(hash: String, cifrado: String, timestamp: Long) {
         if (!SecurityUtils.esHashSha256(hash) || cifrado.isBlank()) return
+        val plano = SecurityUtils.descifrarAES(cifrado.trim()) ?: descifrarCodigoAuthLocal(cifrado) ?: return
+        if (!SecurityUtils.verificarCodigoAutorizacion(plano, hash)) return
         val db = writableDatabase
         crearTablaEstadoPanel(db)
         val valores = ContentValues().apply {
             put("codigo_auth_hash", hash.trim())
-            put("codigo_auth_cifrado", cifrado.trim())
+            put("codigo_auth_cifrado", cifrarCodigoAuthLocal(plano))
             put("timestamp_codigo_auth", timestamp)
         }
         db.update("estado_panel", valores, "id = 1", null)
@@ -671,7 +762,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
     }
 
     /**
-     * Guarda el estado actual de los controles en SQLite para no perderlo si se cierra la app.
+     * Guarda el estado actual de los controles en SQLite (sellando RFID/PIN con Android Keystore).
      */
     fun guardarEstadoPanel(
         puertaAbierta: Boolean,
@@ -682,7 +773,8 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
         pinBotonera: String,
         timestampModificacion: Long,
         ultimaIp: String,
-        timestampOperadores: Long = 0L
+        timestampOperadores: Long = 0L,
+        ultimaIpEsp32: String? = null
     ) {
         val db = writableDatabase
         crearTablaEstadoPanel(db)
@@ -691,11 +783,69 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
             put("angulo_servo", anguloServo)
             put("buzzer_activo", if (buzzerActivo) 1 else 0)
             put("modo_acceso", modoAcceso)
-            put("uid_rfid", uidRfid)
-            put("pin_botonera", pinBotonera)
+            put("uid_rfid", cifrarCredencialPanelLocal(uidRfid))
+            put("pin_botonera", cifrarCredencialPanelLocal(pinBotonera))
             put("timestamp_modificacion", timestampModificacion)
             put("ultima_ip", ultimaIp)
             put("timestamp_operadores", timestampOperadores)
+            if (!ultimaIpEsp32.isNullOrBlank()) {
+                put("ultima_ip_esp32", ultimaIpEsp32.trim())
+            }
+        }
+        db.update("estado_panel", valores, "id = 1", null)
+    }
+
+    /** Guarda únicamente la última IP del ESP32 utilizada o descubierta en SQLite. */
+    fun guardarIpEsp32(ipEsp32: String) {
+        val ipLimpia = ipEsp32.trim()
+        if (ipLimpia.isEmpty()) return
+        val db = writableDatabase
+        crearTablaEstadoPanel(db)
+        val valores = ContentValues().apply {
+            put("ultima_ip_esp32", ipLimpia)
+        }
+        db.update("estado_panel", valores, "id = 1", null)
+    }
+
+    /** Devuelve (intentosFallidos, bloqueado) persistidos en SQLite para el Login. */
+    fun obtenerEstadoBloqueoLogin(): Pair<Int, Boolean> {
+        val db = writableDatabase
+        crearTablaEstadoPanel(db)
+        val cursor = db.rawQuery(
+            "SELECT intentos_fallidos_login, login_bloqueado FROM estado_panel WHERE id = 1",
+            null
+        )
+        var intentos = 0
+        var bloqueado = false
+        if (cursor.moveToFirst()) {
+            intentos = cursor.getInt(0)
+            bloqueado = cursor.getInt(1) == 1 || intentos >= SecurityUtils.MAX_INTENTOS_LOGIN
+        }
+        cursor.close()
+        return intentos to bloqueado
+    }
+
+    /** Registra un intento fallido de inicio de sesión y activa el bloqueo definitivo al alcanzar 3 fallos. */
+    fun registrarFalloLogin(): Pair<Int, Boolean> {
+        val (intentosActuales, yaBloqueado) = obtenerEstadoBloqueoLogin()
+        val nuevosIntentos = (intentosActuales + 1).coerceAtMost(SecurityUtils.MAX_INTENTOS_LOGIN)
+        val bloqueado = yaBloqueado || nuevosIntentos >= SecurityUtils.MAX_INTENTOS_LOGIN
+        val db = writableDatabase
+        val valores = ContentValues().apply {
+            put("intentos_fallidos_login", nuevosIntentos)
+            put("login_bloqueado", if (bloqueado) 1 else 0)
+        }
+        db.update("estado_panel", valores, "id = 1", null)
+        return nuevosIntentos to bloqueado
+    }
+
+    /** Reinicia el bloqueo tras un acceso válido o desbloqueo autorizado por el Supervisor. */
+    fun reiniciarBloqueoLogin() {
+        val db = writableDatabase
+        crearTablaEstadoPanel(db)
+        val valores = ContentValues().apply {
+            put("intentos_fallidos_login", 0)
+            put("login_bloqueado", 0)
         }
         db.update("estado_panel", valores, "id = 1", null)
     }
@@ -707,7 +857,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
         val db = writableDatabase
         crearTablaEstadoPanel(db)
         val cursor = db.rawQuery(
-            "SELECT puerta_abierta, angulo_servo, buzzer_activo, modo_acceso, uid_rfid, pin_botonera, timestamp_modificacion, ultima_ip, timestamp_operadores, timestamp_codigo_auth FROM estado_panel WHERE id = 1",
+            "SELECT puerta_abierta, angulo_servo, buzzer_activo, modo_acceso, uid_rfid, pin_botonera, timestamp_modificacion, ultima_ip, timestamp_operadores, timestamp_codigo_auth, ultima_ip_esp32 FROM estado_panel WHERE id = 1",
             null
         )
         var estado = EstadoGuardadoSQLite(
@@ -720,7 +870,8 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
             timestampModificacion = 0L,
             ultimaIpDestino = "192.168.43.1",
             timestampOperadores = 0L,
-            timestampCodigoAuth = 0L
+            timestampCodigoAuth = 0L,
+            ultimaIpEsp32 = "192.168.43.50"
         )
         if (cursor.moveToFirst()) {
             estado = EstadoGuardadoSQLite(
@@ -728,12 +879,13 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "acceso_iot.d
                 anguloServo = cursor.getInt(1),
                 buzzerActivo = cursor.getInt(2) == 1,
                 modoAcceso = cursor.getString(3) ?: "RFID",
-                uidRfid = cursor.getString(4) ?: "A4-9B-3C-12",
-                pinBotonera = cursor.getString(5) ?: "4829",
+                uidRfid = descifrarCredencialPanelLocal(cursor.getString(4) ?: "", "A4-9B-3C-12"),
+                pinBotonera = descifrarCredencialPanelLocal(cursor.getString(5) ?: "", "4829"),
                 timestampModificacion = cursor.getLong(6),
                 ultimaIpDestino = cursor.getString(7) ?: "192.168.43.1",
                 timestampOperadores = cursor.getLong(8),
-                timestampCodigoAuth = cursor.getLong(9)
+                timestampCodigoAuth = cursor.getLong(9),
+                ultimaIpEsp32 = cursor.getString(10)?.takeIf { it.isNotBlank() } ?: "192.168.43.50"
             )
         }
         cursor.close()

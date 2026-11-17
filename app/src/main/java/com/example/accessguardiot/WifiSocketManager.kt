@@ -687,11 +687,13 @@ class WifiSocketManager(context: Context? = null) {
 
         for (prefijo in prefijos) {
             if (estaConectado()) break
+            // En el emulador (10.0.2.x) el host es 10.0.2.2; no escanear 10.0.2.1..254 para no saturar NAT
+            if (prefijo == "10.0.2") continue
             val hosts = (1..254).map { "$prefijo.$it" }
                 .filter { it !in ipsPropias && it !in ipsNoValidas }
 
             coroutineScope {
-                for (bloque in hosts.chunked(64)) {
+                for (bloque in hosts.chunked(16)) {
                     if (estaConectado()) break
                     val encontrados = bloque.map { ip ->
                         async(Dispatchers.IO) {
@@ -837,6 +839,9 @@ class WifiSocketManager(context: Context? = null) {
 
     // ---------------------------- NsdManager (mDNS / DNS-SD) ----------------------------
     private fun iniciarNsd() {
+        // En Android 16/17+ (API 36+) NsdManager.discoverServices abre un diálogo del sistema
+        // (NsdPickerActivity) que bloquea la pantalla; en esas versiones usamos UDP + Gateway + Subred.
+        if (android.os.Build.VERSION.SDK_INT >= 36) return
         val ctx = appContext ?: return
         if (nsdManager != null) return
         try {

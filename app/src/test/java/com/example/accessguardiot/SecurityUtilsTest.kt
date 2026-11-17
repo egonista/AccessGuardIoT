@@ -96,4 +96,37 @@ class SecurityUtilsTest {
         assertTrue(SecurityUtils.esEventoOperativoVisible("SUPERVISOR (supervisor)", "rotó la llave de autorización y recuperación", esSupervisor = true))
         assertTrue(SecurityUtils.esEventoOperativoVisible("SEGURIDAD", "Intento bloqueado por uso de credencial restringida (admin)", esSupervisor = true))
     }
+
+    @Test
+    fun desbloqueo_tras_3_intentos_exige_llave_o_clave_supervisor() {
+        assertEquals(3, SecurityUtils.MAX_INTENTOS_LOGIN)
+        assertNotNull(
+            SecurityUtils.validarDesbloqueoAcceso(
+                codigoAutorizacion = "",
+                codigoAutorizacionValido = false,
+                codigoSupervisorValido = false
+            )
+        )
+        assertNotNull(
+            SecurityUtils.validarDesbloqueoAcceso(
+                codigoAutorizacion = "AG-AAAA-BBBB",
+                codigoAutorizacionValido = false,
+                codigoSupervisorValido = false
+            )
+        )
+        assertNull(
+            SecurityUtils.validarDesbloqueoAcceso(
+                codigoAutorizacion = "AG-7K4M-9P2Q",
+                codigoAutorizacionValido = true,
+                codigoSupervisorValido = false
+            )
+        )
+        assertNull(
+            SecurityUtils.validarDesbloqueoAcceso(
+                codigoAutorizacion = "Sup#2026IoT",
+                codigoAutorizacionValido = false,
+                codigoSupervisorValido = true
+            )
+        )
+    }
 }

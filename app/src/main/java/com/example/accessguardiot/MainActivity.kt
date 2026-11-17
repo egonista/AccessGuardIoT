@@ -78,6 +78,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var dbHelper: DatabaseHelper
     private lateinit var wifiManager: WifiSocketManager
+    private lateinit var esp32Manager: Esp32SocketManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,6 +86,7 @@ class MainActivity : ComponentActivity() {
 
         dbHelper = DatabaseHelper(this)
         wifiManager = WifiSocketManager(this)
+        esp32Manager = Esp32SocketManager(this)
 
         setContent {
             AccessGuardIoTTheme {
@@ -92,6 +94,7 @@ class MainActivity : ComponentActivity() {
                     AccessGuardApp(
                         dbHelper = dbHelper,
                         wifiManager = wifiManager,
+                        esp32Manager = esp32Manager,
                         modifier = Modifier
                             .padding(innerPadding)
                             .consumeWindowInsets(innerPadding)
@@ -105,6 +108,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         wifiManager.detenerServidor()
+        esp32Manager.detener()
     }
 }
 
@@ -131,6 +135,7 @@ private fun rememberScrollAlEnfocarModifier(): Modifier {
 fun AccessGuardApp(
     dbHelper: DatabaseHelper,
     wifiManager: WifiSocketManager,
+    esp32Manager: Esp32SocketManager,
     modifier: Modifier = Modifier
 ) {
     // Cargar estado persistido en SQLite (por si la app se cerró y se volvió a abrir)
@@ -152,7 +157,7 @@ fun AccessGuardApp(
     var timestampOperadores by remember { mutableLongStateOf(estadoInicialSQLite.timestampOperadores) }
     var codigoAutorizacionActual by remember { mutableStateOf(dbHelper.obtenerCodigoAutorizacionVisible()) }
 
-    // Estados de red Wi-Fi / Hotspot y cifrado AES-128
+    // Estados de red Wi-Fi / Hotspot (Puerto 5000 entre celulares) y cifrado AES-128
     var ipLocal by remember { mutableStateOf(wifiManager.obtenerIpLocal()) }
     var ipDestino by remember { mutableStateOf(estadoInicialSQLite.ultimaIpDestino) }
     var estadoConexion by remember { mutableStateOf("Servicio activo, en espera de enlace") }
@@ -167,6 +172,15 @@ fun AccessGuardApp(
             )
         )
     }
+
+    // Estados de enlace hardware ESP32 (Puerto 5002 en paralelo al puerto 5000)
+    var ipEsp32 by remember { mutableStateOf(estadoInicialSQLite.ultimaIpEsp32) }
+    var esp32Conectado by remember { mutableStateOf(esp32Manager.estaConectado()) }
+    var esp32Endpoint by remember { mutableStateOf<String?>(null) }
+    var estadoConexionEsp32 by remember {
+        mutableStateOf("Escuchando en puerto ${Esp32Protocol.PUERTO_ESP32}")
+    }
+    var ultimaTramaEsp32 by remember { mutableStateOf("Sin tramas recibidas aún") }
 
     // Lista de bitácora y operadores cargados desde SQLite
     var listaEventos by remember { mutableStateOf(dbHelper.obtenerEventos()) }
@@ -207,7 +221,194 @@ fun AccessGuardApp(
         )
     }
 
-    // Iniciar el ServerSocket(5000) y la autoconexión/autodescubrimiento desde que se abre la app
+    // Función auxiliar que guarda cada movimiento en SQLite, lo envía por Wi-Fi (5000) y al ESP32 (5002)
+    fun registrarYSincronizar(
+        nuevaPuerta: Boolean = puertaAbierta,
+        nuevoAngulo: Int = anguloServo,
+        nuevoBuzzer: Boolean = buzzerActivo,
+        nuevoModo: String = modoAcceso,
+        nuevoUid: String = uidRfid,
+        nuevoPin: String = pinBotonera,
+        esCambioOperadores: Boolean = false,
+        detalleAccion: String,
+        rolOverride: String? = null,
+        enviarAEsp32: Boolean = true
+    ) {
+        val actor = rolOverride ?: etiquetaActor(rolActivo, usuarioActivo)
+        val ahora = System.currentTimeMillis()
+
+        puertaAbierta = nuevaPuerta
+        anguloServo = nuevoAngulo
+        buzzerActivo = nuevoBuzzer
+        modoAcceso = nuevoModo
+        uidRfid = nuevoUid
+        pinBotonera = nuevoPin
+        timestampModificacion = ahora
+        if (esCambioOperadores) {
+            timestampOperadores = ahora
+        }
+
+        // 1. Guardar evento y estado actual en SQLite local (acceso_iot.db)
+        dbHelper.insertarEvento(actor, detalleAccion)
+        dbHelper.guardarEstadoPanel(
+            puertaAbierta = nuevaPuerta,
+            anguloServo = nuevoAngulo,
+            buzzerActivo = nuevoBuzzer,
+            modoAcceso = nuevoModo,
+            uidRfid = nuevoUid,
+            pinBotonera = nuevoPin,
+            timestampModificacion = ahora,
+            ultimaIp = ipDestino,
+            timestampOperadores = timestampOperadores
+        )
+        listaEventos = dbHelper.obtenerEventos()
+        listaOperadores = dbHelper.obtenerOperadores()
+
+        // 2. Enviar trama cifrada AES-128 por socket bidireccional (Puerto 5000)
+        val (hashAuth, cifradoAuth, tsAuth) = dbHelper.obtenerDatosSyncCodigoAuth()
+        val estadoActual = EstadoSincronizadoIoT(
+            puertaAbierta = nuevaPuerta,
+            anguloServo = nuevoAngulo,
+            buzzerActivo = nuevoBuzzer,
+            modoAcceso = nuevoModo,
+            uidRfid = nuevoUid,
+            pinBotonera = nuevoPin,
+            rolEmisor = actor,
+            detalleEvento = detalleAccion,
+            timestampModificacion = ahora,
+            esSincronizacionInicial = false,
+            historialEventos = dbHelper.obtenerEventosParaSincronizar(30),
+            operadoresRegistrados = listaOperadores,
+            timestampOperadores = timestampOperadores,
+            claveSupervisor = dbHelper.obtenerPasswordSupervisor(),
+            codigoAuthHash = hashAuth,
+            codigoAuthCifrado = cifradoAuth,
+            timestampCodigoAuth = tsAuth
+        )
+        wifiManager.enviarCambio(ipDestino, estadoActual) { mensajeRed, tramaAES ->
+            estadoConexion = mensajeRed
+            if (tramaAES.isNotBlank()) {
+                ultimaTramaAES = tramaAES
+            }
+        }
+
+        // 3. Replicar estado físico al ESP32 conectado (Puerto 5002)
+        if (enviarAEsp32 && esp32Manager.estaConectado()) {
+            esp32Manager.enviarEstado(
+                puertaAbierta = nuevaPuerta,
+                anguloServo = nuevoAngulo,
+                buzzerActivo = nuevoBuzzer,
+                modoAcceso = nuevoModo,
+                uidRfid = nuevoUid,
+                pinBotonera = nuevoPin
+            )
+        }
+    }
+
+    // Registra un evento de seguridad en bitácora sin alterar controles físicos (ej. bloqueo o desbloqueo en Login)
+    fun sincronizarSoloBitacoraSeguridad(detalle: String, incluirCambioAuth: Boolean = false) {
+        dbHelper.insertarEvento("SEGURIDAD", detalle)
+        listaEventos = dbHelper.obtenerEventos()
+        if (incluirCambioAuth) {
+            timestampOperadores = System.currentTimeMillis()
+            dbHelper.guardarEstadoPanel(
+                puertaAbierta, anguloServo, buzzerActivo, modoAcceso,
+                uidRfid, pinBotonera, timestampModificacion, ipDestino, timestampOperadores
+            )
+        }
+        if (wifiManager.estaEnlazado()) {
+            val estadoSync = construirEstadoParaSync(
+                esSyncInicial = !incluirCambioAuth,
+                rolEmisor = "SEGURIDAD",
+                detalle = detalle
+            )
+            wifiManager.enviarCambio(ipDestino, estadoSync) { mensajeRed, tramaAES ->
+                estadoConexion = mensajeRed
+                if (tramaAES.isNotBlank()) ultimaTramaAES = tramaAES
+            }
+        }
+    }
+
+    // Procesa tramas de sensores o cambios físicos enviados desde el ESP32
+    fun procesarMensajeHardwareEsp32(mensaje: Esp32Protocol.MensajeEsp32) {
+        when (mensaje) {
+            is Esp32Protocol.MensajeEsp32.Estado -> {
+                val puerta = mensaje.puertaAbierta ?: puertaAbierta
+                val angulo = mensaje.anguloServo ?: if (puerta) 90 else 0
+                val buzzer = mensaje.buzzerActivo ?: buzzerActivo
+                val modo = mensaje.modoAcceso ?: modoAcceso
+                val det = mensaje.detalle ?: "actualizó estado físico desde ESP32"
+                val rolEvento = if (det.contains("denegado", ignoreCase = true) ||
+                    det.contains("no autorizad", ignoreCase = true) ||
+                    det.contains("incorrecto", ignoreCase = true) ||
+                    det.contains("lockdown", ignoreCase = true)
+                ) "SEGURIDAD" else "ESP32 (Hardware)"
+                registrarYSincronizar(
+                    nuevaPuerta = puerta,
+                    nuevoAngulo = angulo,
+                    nuevoBuzzer = buzzer,
+                    nuevoModo = modo,
+                    detalleAccion = det,
+                    rolOverride = rolEvento,
+                    enviarAEsp32 = false
+                )
+            }
+            is Esp32Protocol.MensajeEsp32.TarjetaRfid -> {
+                if (modoAcceso == "LOCKDOWN") {
+                    esp32Manager.enviarLinea("ERR|LOCKDOWN")
+                    sincronizarSoloBitacoraSeguridad("Tarjeta RFID rechazada en ESP32: modo LOCKDOWN activo")
+                } else if (modoAcceso == "RFID" || modoAcceso == "RFID_PIN") {
+                    val uidNormalizado = mensaje.uid.replace(" ", "-")
+                    val uidPanelNormalizado = uidRfid.replace(" ", "-")
+                    val uidEnmascarado = "****-${uidNormalizado.takeLast(2)}"
+                    if (uidNormalizado.equals(uidPanelNormalizado, ignoreCase = true)) {
+                        registrarYSincronizar(
+                            nuevaPuerta = true,
+                            nuevoAngulo = 90,
+                            nuevoBuzzer = false,
+                            detalleAccion = "abrió puerta con tarjeta RFID autorizada ($uidEnmascarado)",
+                            rolOverride = "ESP32 (RFID)"
+                        )
+                        esp32Manager.enviarLinea("OK|PUERTA=ABIERTA")
+                    } else {
+                        registrarYSincronizar(
+                            nuevoBuzzer = true,
+                            detalleAccion = "Tarjeta RFID no autorizada detectada en ESP32 ($uidEnmascarado)",
+                            rolOverride = "SEGURIDAD"
+                        )
+                        esp32Manager.enviarLinea("ERR|RFID_INVALIDO")
+                    }
+                }
+            }
+            is Esp32Protocol.MensajeEsp32.PinBotonera -> {
+                if (modoAcceso == "LOCKDOWN") {
+                    esp32Manager.enviarLinea("ERR|LOCKDOWN")
+                    sincronizarSoloBitacoraSeguridad("PIN rechazado en ESP32: modo LOCKDOWN activo")
+                } else if (modoAcceso == "BOTONERA" || modoAcceso == "RFID_PIN") {
+                    if (mensaje.pin == pinBotonera) {
+                        registrarYSincronizar(
+                            nuevaPuerta = true,
+                            nuevoAngulo = 90,
+                            nuevoBuzzer = false,
+                            detalleAccion = "abrió puerta con PIN autorizado en botonera ESP32",
+                            rolOverride = "ESP32 (PIN)"
+                        )
+                        esp32Manager.enviarLinea("OK|PUERTA=ABIERTA")
+                    } else {
+                        registrarYSincronizar(
+                            nuevoBuzzer = true,
+                            detalleAccion = "PIN incorrecto ingresado en botonera ESP32",
+                            rolOverride = "SEGURIDAD"
+                        )
+                        esp32Manager.enviarLinea("ERR|PIN_INVALIDO")
+                    }
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    // Iniciar ServerSocket(5000), autoconexión entre celulares y enlace dedicado ESP32 (puerto 5002)
     LaunchedEffect(Unit) {
         wifiManager.iniciarServidor(
             obtenerEstadoParaSync = { construirEstadoParaSync(esSyncInicial = true) },
@@ -267,6 +468,7 @@ fun AccessGuardApp(
                 }
 
                 // 3. Actualizar controles si es un movimiento en vivo o si el otro dispositivo tiene un estado más reciente
+                var enviarNuevoEstadoAEsp32 = false
                 if (!estadoRemoto.esSincronizacionInicial || estadoRemoto.timestampModificacion >= timestampModificacion) {
                     puertaAbierta = estadoRemoto.puertaAbierta
                     anguloServo = estadoRemoto.anguloServo
@@ -276,6 +478,7 @@ fun AccessGuardApp(
                     pinBotonera = estadoRemoto.pinBotonera
                     timestampModificacion = estadoRemoto.timestampModificacion
                     actualizarPanelSQLite = true
+                    enviarNuevoEstadoAEsp32 = true
                 }
 
                 if (actualizarPanelSQLite) {
@@ -289,6 +492,12 @@ fun AccessGuardApp(
                         timestampModificacion = timestampModificacion,
                         ultimaIp = ipDestino,
                         timestampOperadores = timestampOperadores
+                    )
+                }
+
+                if (enviarNuevoEstadoAEsp32 && esp32Manager.estaConectado()) {
+                    esp32Manager.enviarEstado(
+                        puertaAbierta, anguloServo, buzzerActivo, modoAcceso, uidRfid, pinBotonera
                     )
                 }
 
@@ -324,77 +533,31 @@ fun AccessGuardApp(
                 }
             }
         )
-    }
 
-    // Función auxiliar que guarda cada movimiento en SQLite y lo envía cifrado con AES-128 por el socket bidireccional
-    fun registrarYSincronizar(
-        nuevaPuerta: Boolean = puertaAbierta,
-        nuevoAngulo: Int = anguloServo,
-        nuevoBuzzer: Boolean = buzzerActivo,
-        nuevoModo: String = modoAcceso,
-        nuevoUid: String = uidRfid,
-        nuevoPin: String = pinBotonera,
-        esCambioOperadores: Boolean = false,
-        detalleAccion: String,
-        rolOverride: String? = null
-    ) {
-        val actor = rolOverride ?: etiquetaActor(rolActivo, usuarioActivo)
-        val ahora = System.currentTimeMillis()
-
-        puertaAbierta = nuevaPuerta
-        anguloServo = nuevoAngulo
-        buzzerActivo = nuevoBuzzer
-        modoAcceso = nuevoModo
-        uidRfid = nuevoUid
-        pinBotonera = nuevoPin
-        timestampModificacion = ahora
-        if (esCambioOperadores) {
-            timestampOperadores = ahora
-        }
-
-        // 1. Guardar evento e estado actual en SQLite local (acceso_iot.db)
-        dbHelper.insertarEvento(actor, detalleAccion)
-        dbHelper.guardarEstadoPanel(
-            puertaAbierta = nuevaPuerta,
-            anguloServo = nuevoAngulo,
-            buzzerActivo = nuevoBuzzer,
-            modoAcceso = nuevoModo,
-            uidRfid = nuevoUid,
-            pinBotonera = nuevoPin,
-            timestampModificacion = ahora,
-            ultimaIp = ipDestino,
-            timestampOperadores = timestampOperadores
-        )
-        listaEventos = dbHelper.obtenerEventos()
-        listaOperadores = dbHelper.obtenerOperadores()
-
-        // 2. Enviar trama cifrada AES-128 (incluyendo los últimos registros SQLite, usuarios y llave sincronizada)
-        val (hashAuth, cifradoAuth, tsAuth) = dbHelper.obtenerDatosSyncCodigoAuth()
-        val estadoActual = EstadoSincronizadoIoT(
-            puertaAbierta = nuevaPuerta,
-            anguloServo = nuevoAngulo,
-            buzzerActivo = nuevoBuzzer,
-            modoAcceso = nuevoModo,
-            uidRfid = nuevoUid,
-            pinBotonera = nuevoPin,
-            rolEmisor = actor,
-            detalleEvento = detalleAccion,
-            timestampModificacion = ahora,
-            esSincronizacionInicial = false,
-            historialEventos = dbHelper.obtenerEventosParaSincronizar(30),
-            operadoresRegistrados = listaOperadores,
-            timestampOperadores = timestampOperadores,
-            claveSupervisor = dbHelper.obtenerPasswordSupervisor(),
-            codigoAuthHash = hashAuth,
-            codigoAuthCifrado = cifradoAuth,
-            timestampCodigoAuth = tsAuth
-        )
-        wifiManager.enviarCambio(ipDestino, estadoActual) { mensajeRed, tramaAES ->
-            estadoConexion = mensajeRed
-            if (tramaAES.isNotBlank()) {
-                ultimaTramaAES = tramaAES
+        // Enlace Wi-Fi TCP dedicado para hardware ESP32 en Puerto 5002 (paralelo al Puerto 5000)
+        esp32Manager.iniciar(
+            onEstadoEnlace = { conectado, endpoint, detalle ->
+                esp32Conectado = conectado
+                esp32Endpoint = endpoint
+                estadoConexionEsp32 = detalle
+                if (conectado) {
+                    val ipSolo = endpoint?.substringBefore(":")?.trim()
+                    if (!ipSolo.isNullOrBlank() && ipSolo != ipEsp32) {
+                        ipEsp32 = ipSolo
+                        dbHelper.guardarIpEsp32(ipSolo)
+                    }
+                    esp32Manager.enviarEstado(
+                        puertaAbierta, anguloServo, buzzerActivo, modoAcceso, uidRfid, pinBotonera
+                    )
+                }
+            },
+            onMensajeHardware = { msg ->
+                procesarMensajeHardwareEsp32(msg)
+            },
+            onTrama = { trama ->
+                ultimaTramaEsp32 = trama
             }
-        }
+        )
     }
 
     if (rolActivo == null) {
@@ -405,6 +568,8 @@ fun AccessGuardApp(
             estadoConexion = estadoConexion,
             enlaceActivo = enlaceActivo,
             ipEnlazada = ipEnlazada,
+            esp32Conectado = esp32Conectado,
+            esp32Endpoint = esp32Endpoint,
             avisoSesionRevocada = avisoSesionRevocada,
             onLimpiarAvisoSesion = { avisoSesionRevocada = null },
             onRefrescarIpLocal = { ipLocal = wifiManager.obtenerIpLocal() },
@@ -424,6 +589,35 @@ fun AccessGuardApp(
                     }
                 }
             },
+            onEventoSeguridadLogin = { detalle ->
+                sincronizarSoloBitacoraSeguridad(detalle)
+            },
+            onDesbloquearLogin = { codigoAuth ->
+                val esLlaveRecuperacion = dbHelper.esCodigoAutorizacionValido(codigoAuth)
+                val esClaveSupervisor = dbHelper.esCodigoSupervisorValido(codigoAuth)
+                val errorValidacion = SecurityUtils.validarDesbloqueoAcceso(
+                    codigoAutorizacion = codigoAuth,
+                    codigoAutorizacionValido = esLlaveRecuperacion,
+                    codigoSupervisorValido = esClaveSupervisor
+                )
+                if (errorValidacion != null) {
+                    sincronizarSoloBitacoraSeguridad("Intento fallido de desbloqueo de acceso desde Login")
+                    false to errorValidacion
+                } else {
+                    dbHelper.reiniciarBloqueoLogin()
+                    if (esLlaveRecuperacion) {
+                        codigoAutorizacionActual = dbHelper.rotarCodigoAutorizacion()
+                    }
+                    sincronizarSoloBitacoraSeguridad(
+                        detalle = "desbloqueó el acceso mediante autorización del Supervisor",
+                        incluirCambioAuth = esLlaveRecuperacion
+                    )
+                    val msgExtra = if (esLlaveRecuperacion) {
+                        " La llave de recuperación fue renovada por seguridad."
+                    } else ""
+                    true to "Acceso desbloqueado.$msgExtra Ya puedes iniciar sesión."
+                }
+            },
             onRestablecerPassword = { user, codigoAuth, nuevaPass ->
                 val uLimpio = user.trim()
                 if (!dbHelper.existeUsuario(uLimpio)) {
@@ -439,22 +633,25 @@ fun AccessGuardApp(
                         codigoSupervisorValido = esClaveSupervisor
                     )
                     if (errorValidacion != null) {
+                        sincronizarSoloBitacoraSeguridad("Intento fallido de restablecimiento para '$uLimpio'")
                         false to errorValidacion
                     } else {
                         val rolActualizado = dbHelper.actualizarPasswordUsuario(uLimpio, nuevaPass)
                         if (rolActualizado != null) {
+                            dbHelper.reiniciarBloqueoLogin()
                             if (esLlaveRecuperacion) {
                                 codigoAutorizacionActual = dbHelper.rotarCodigoAutorizacion()
                             }
                             registrarYSincronizar(
                                 esCambioOperadores = true,
                                 rolOverride = "SEGURIDAD",
-                                detalleAccion = "restableció la contraseña de '$uLimpio' ($rolActualizado)"
+                                detalleAccion = "restableció la contraseña de '$uLimpio' ($rolActualizado)",
+                                enviarAEsp32 = false
                             )
                             val msgExtra = if (esLlaveRecuperacion) {
                                 " La llave de recuperación fue renovada por seguridad."
                             } else ""
-                            true to "Contraseña de '$uLimpio' actualizada y sincronizada.$msgExtra"
+                            true to "Contraseña de '$uLimpio' actualizada y acceso habilitado.$msgExtra"
                         } else {
                             false to "No se pudo actualizar la contraseña."
                         }
@@ -462,6 +659,7 @@ fun AccessGuardApp(
                 }
             },
             onLoginExitoso = { rolAutenticado, usuarioAutenticado ->
+                dbHelper.reiniciarBloqueoLogin()
                 ipLocal = wifiManager.obtenerIpLocal()
                 avisoSesionRevocada = null
                 usuarioActivo = usuarioAutenticado
@@ -516,6 +714,26 @@ fun AccessGuardApp(
             estadoConexion = estadoConexion,
             enlaceActivo = enlaceActivo,
             ipEnlazada = ipEnlazada,
+            esp32Conectado = esp32Conectado,
+            esp32Endpoint = esp32Endpoint,
+            estadoConexionEsp32 = estadoConexionEsp32,
+            ultimaTramaEsp32 = ultimaTramaEsp32,
+            ipEsp32 = ipEsp32,
+            onIpEsp32Change = { nuevaIp ->
+                ipEsp32 = nuevaIp
+                dbHelper.guardarIpEsp32(nuevaIp)
+            },
+            onConectarEsp32 = {
+                ipLocal = wifiManager.obtenerIpLocal()
+                dbHelper.guardarIpEsp32(ipEsp32)
+                esp32Manager.conectarManual(ipEsp32, Esp32Protocol.PUERTO_ESP32)
+            },
+            onDesconectarEsp32 = {
+                esp32Manager.desconectar()
+            },
+            onPingEsp32 = {
+                esp32Manager.enviarPing()
+            },
             ultimaTramaAES = ultimaTramaAES,
             listaEventos = listaEventos,
             listaOperadores = listaOperadores,
@@ -599,24 +817,15 @@ fun AccessGuardApp(
     }
 }
 
-// =========================================================================================
-// BARRA PERSISTENTE DE ESTADO DE CONEXIÓN BIDIRECCIONAL EN PUERTO 5000
-// =========================================================================================
 @Composable
-fun BarraEstadoConexionIoT(
-    enlaceActivo: Boolean,
-    ipEnlazada: String?,
-    mostrarDetalleTecnico: Boolean = true,
+private fun BarraEstadoCard(
+    activo: Boolean,
+    mensaje: String,
     modifier: Modifier = Modifier
 ) {
-    val fondo = if (enlaceActivo) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
-    val borde = if (enlaceActivo) Color(0xFF4CAF50) else Color(0xFFFFB300)
-    val colorTexto = if (enlaceActivo) Color(0xFF1B5E20) else Color(0xFFE65100)
-    val mensaje = when {
-        enlaceActivo -> "🟢 Sistema en línea • Sincronización activa"
-        mostrarDetalleTecnico -> "🔄 Sin enlace activo • Reconectando automáticamente..."
-        else -> "🔄 Conectando con el sistema de acceso..."
-    }
+    val fondo = if (activo) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
+    val borde = if (activo) Color(0xFF4CAF50) else Color(0xFFFFB300)
+    val colorTexto = if (activo) Color(0xFF1B5E20) else Color(0xFFE65100)
 
     Card(
         colors = CardDefaults.cardColors(containerColor = fondo),
@@ -635,7 +844,41 @@ fun BarraEstadoConexionIoT(
 }
 
 // =========================================================================================
-// PANTALLA 1: LOGIN CON VALIDACIÓN ISO/IEC 27400 Y BLOQUEO TRAS 3 INTENTOS FALLIDOS
+// BARRA PERSISTENTE DE ESTADO DE CONEXIÓN BIDIRECCIONAL EN PUERTO 5000 Y ESP32 EN PUERTO 5002
+// =========================================================================================
+@Composable
+fun BarraEstadoConexionIoT(
+    enlaceActivo: Boolean,
+    ipEnlazada: String?,
+    mostrarDetalleTecnico: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    val mensaje = when {
+        enlaceActivo && mostrarDetalleTecnico && !ipEnlazada.isNullOrBlank() ->
+            "🟢 Celulares enlazados • $ipEnlazada (Puerto 5000)"
+        enlaceActivo -> "🟢 Sistema en línea • Sincronización activa"
+        mostrarDetalleTecnico -> "🔄 Sin enlace móvil • Buscando en puerto 5000..."
+        else -> "🔄 Conectando con el sistema de acceso..."
+    }
+    BarraEstadoCard(activo = enlaceActivo, mensaje = mensaje, modifier = modifier)
+}
+
+@Composable
+fun BarraEstadoConexionEsp32(
+    esp32Conectado: Boolean,
+    esp32Endpoint: String?,
+    modifier: Modifier = Modifier
+) {
+    val mensaje = if (esp32Conectado) {
+        "🟢 ESP32 conectado • ${esp32Endpoint ?: "Puerto ${Esp32Protocol.PUERTO_ESP32}"}"
+    } else {
+        "🔌 ESP32 sin enlace • Puerto ${Esp32Protocol.PUERTO_ESP32} en espera"
+    }
+    BarraEstadoCard(activo = esp32Conectado, mensaje = mensaje, modifier = modifier)
+}
+
+// =========================================================================================
+// PANTALLA 1: LOGIN CON VALIDACIÓN ISO/IEC 27400 Y BLOQUEO DEFINITIVO TRAS 3 INTENTOS FALLIDOS
 // =========================================================================================
 @Composable
 fun LoginScreen(
@@ -645,21 +888,34 @@ fun LoginScreen(
     estadoConexion: String,
     enlaceActivo: Boolean,
     ipEnlazada: String?,
+    esp32Conectado: Boolean,
+    esp32Endpoint: String?,
     avisoSesionRevocada: String?,
     onLimpiarAvisoSesion: () -> Unit,
     onRefrescarIpLocal: () -> Unit,
     onIpDestinoChange: (String) -> Unit,
     onConectarYSincronizar: () -> Unit,
+    onEventoSeguridadLogin: (detalle: String) -> Unit,
+    onDesbloquearLogin: (codigoAutorizacion: String) -> Pair<Boolean, String>,
     onRestablecerPassword: (username: String, codigoAutorizacion: String, nuevaPassword: String) -> Pair<Boolean, String>,
     onLoginExitoso: (rol: String, username: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val (intentosIniciales, bloqueadoInicial) = remember { dbHelper.obtenerEstadoBloqueoLogin() }
     var usuario by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
-    var mensajeError by rememberSaveable { mutableStateOf<String?>(null) }
-    var esAlertaIso by rememberSaveable { mutableStateOf(false) }
+    var intentosFallidos by rememberSaveable { mutableIntStateOf(intentosIniciales) }
+    var loginBloqueado by rememberSaveable { mutableStateOf(bloqueadoInicial) }
+    var mensajeError by rememberSaveable {
+        mutableStateOf(
+            if (bloqueadoInicial) {
+                "Acceso bloqueado tras ${SecurityUtils.MAX_INTENTOS_LOGIN} intentos fallidos. Requiere autorización del Supervisor para desbloquear."
+            } else null
+        )
+    }
+    var esAlertaIso by rememberSaveable { mutableStateOf(bloqueadoInicial) }
 
-    // Estados para "¿Olvidaste tu contraseña? / Restablecer Contraseña" y respaldo manual técnico
+    // Estados para desbloqueo / restablecimiento de contraseña y respaldo manual técnico
     var mostrarRecuperacion by rememberSaveable { mutableStateOf(false) }
     var mostrarRespaldoRed by rememberSaveable { mutableStateOf(false) }
     var usuarioRecuperar by rememberSaveable { mutableStateOf("") }
@@ -668,10 +924,6 @@ fun LoginScreen(
     var mensajeRecuperacion by rememberSaveable { mutableStateOf<String?>(null) }
     var recuperacionOk by rememberSaveable { mutableStateOf(false) }
 
-    // Control de bloqueo temporal tras 3 intentos fallidos
-    var intentosFallidos by rememberSaveable { mutableIntStateOf(0) }
-    var segundosBloqueo by rememberSaveable { mutableIntStateOf(0) }
-
     val scrollState = rememberScrollState()
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -679,17 +931,6 @@ fun LoginScreen(
         focusManager.clearFocus()
         keyboardController?.hide()
         Unit
-    }
-
-    LaunchedEffect(segundosBloqueo) {
-        if (segundosBloqueo > 0) {
-            delay(1000)
-            segundosBloqueo--
-            if (segundosBloqueo == 0) {
-                intentosFallidos = 0
-                mensajeError = null
-            }
-        }
     }
 
     LaunchedEffect(mostrarRespaldoRed) {
@@ -711,6 +952,11 @@ fun LoginScreen(
             enlaceActivo = enlaceActivo,
             ipEnlazada = ipEnlazada,
             mostrarDetalleTecnico = false
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        BarraEstadoConexionEsp32(
+            esp32Conectado = esp32Conectado,
+            esp32Endpoint = esp32Endpoint
         )
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -776,7 +1022,7 @@ fun LoginScreen(
                         },
                         label = { Text("Usuario") },
                         singleLine = true,
-                        enabled = segundosBloqueo == 0,
+                        enabled = !loginBloqueado,
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Text,
                             imeAction = ImeAction.Next
@@ -797,7 +1043,7 @@ fun LoginScreen(
                         label = { Text("Contraseña") },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
-                        enabled = segundosBloqueo == 0,
+                        enabled = !loginBloqueado,
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Password,
                             imeAction = ImeAction.Done
@@ -831,28 +1077,46 @@ fun LoginScreen(
                         Spacer(modifier = Modifier.height(12.dp))
                     }
 
+                    fun registrarFalloEnPantalla(
+                        mensajeParcial: String,
+                        eventoSeguridad: String?,
+                        alertaRoja: Boolean
+                    ) {
+                        val (intentos, bloqueadoAhora) = dbHelper.registrarFalloLogin()
+                        intentosFallidos = intentos
+                        loginBloqueado = bloqueadoAhora
+                        if (eventoSeguridad != null) {
+                            onEventoSeguridadLogin(eventoSeguridad)
+                        }
+                        if (bloqueadoAhora) {
+                            onEventoSeguridadLogin(
+                                "Acceso bloqueado definitivamente tras ${SecurityUtils.MAX_INTENTOS_LOGIN} intentos fallidos (requiere autorización del Supervisor)"
+                            )
+                            esAlertaIso = true
+                            mensajeError = "Acceso bloqueado tras ${SecurityUtils.MAX_INTENTOS_LOGIN} intentos fallidos. Requiere autorización del Supervisor para desbloquear."
+                        } else {
+                            esAlertaIso = alertaRoja
+                            mensajeError = "$mensajeParcial Intento $intentos de ${SecurityUtils.MAX_INTENTOS_LOGIN}."
+                        }
+                    }
+
                     Button(
                         onClick = {
                             ocultarTeclado()
+                            if (loginBloqueado) return@Button
+
                             // 1. Validar Norma ISO/IEC 27400 (Prohibición de credenciales por defecto)
                             val credencialCombinada = "${usuario.trim()}/${password.trim()}"
                             if (SecurityUtils.esCredencialProhibida(usuario) ||
                                 SecurityUtils.esCredencialProhibida(password) ||
                                 SecurityUtils.esCredencialProhibida(credencialCombinada)
                             ) {
-                                esAlertaIso = true
-                                intentosFallidos++
                                 val userLog = usuario.trim().ifBlank { "sin usuario" }
-                                dbHelper.insertarEvento(
-                                    "SEGURIDAD",
-                                    "Intento bloqueado por uso de credencial restringida ($userLog)"
+                                registrarFalloEnPantalla(
+                                    mensajeParcial = "Acceso denegado: credencial restringida por política de seguridad.",
+                                    eventoSeguridad = "Intento bloqueado por uso de credencial restringida ($userLog)",
+                                    alertaRoja = true
                                 )
-                                if (intentosFallidos >= 3) {
-                                    segundosBloqueo = 15
-                                    mensajeError = "Acceso bloqueado temporalmente (15s) tras 3 intentos fallidos."
-                                } else {
-                                    mensajeError = "Acceso denegado: credencial restringida por política de seguridad. Intento $intentosFallidos de 3."
-                                }
                                 return@Button
                             }
 
@@ -860,29 +1124,23 @@ fun LoginScreen(
                             val auth = dbHelper.validarUsuarioConNombre(usuario, password)
                             if (auth != null) {
                                 intentosFallidos = 0
+                                loginBloqueado = false
                                 mensajeError = null
                                 onLimpiarAvisoSesion()
                                 onLoginExitoso(auth.first, auth.second)
                             } else {
-                                esAlertaIso = false
-                                intentosFallidos++
-                                if (intentosFallidos >= 3) {
-                                    segundosBloqueo = 15
-                                    dbHelper.insertarEvento(
-                                        "SEGURIDAD",
-                                        "Acceso bloqueado temporalmente tras 3 intentos fallidos"
-                                    )
-                                    mensajeError = "Acceso bloqueado por 15 segundos tras 3 intentos fallidos."
-                                } else {
-                                    mensajeError = "Usuario o contraseña incorrectos. Intento $intentosFallidos de 3."
-                                }
+                                registrarFalloEnPantalla(
+                                    mensajeParcial = "Usuario o contraseña incorrectos.",
+                                    eventoSeguridad = null,
+                                    alertaRoja = false
+                                )
                             }
                         },
-                        enabled = segundosBloqueo == 0,
+                        enabled = !loginBloqueado,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            if (segundosBloqueo > 0) "Bloqueado temporalmente (${segundosBloqueo}s)"
+                            if (loginBloqueado) "Acceso Bloqueado (Máx. ${SecurityUtils.MAX_INTENTOS_LOGIN} intentos)"
                             else "Iniciar Sesión"
                         )
                     }
@@ -900,14 +1158,17 @@ fun LoginScreen(
                         }
                     ) {
                         Text(
-                            text = "¿Olvidaste tu contraseña? / Restablecer Contraseña",
+                            text = if (loginBloqueado) "🔒 Desbloquear Acceso / Restablecer Contraseña"
+                            else "¿Olvidaste tu contraseña? / Restablecer Contraseña",
                             fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (loginBloqueado) Color(0xFFB71C1C) else Color.Unspecified
                         )
                     }
                 } else {
                     Text(
-                        text = "Restablecer Contraseña",
+                        text = if (loginBloqueado) "Desbloquear Acceso / Restablecer Contraseña"
+                        else "Restablecer Contraseña",
                         fontWeight = FontWeight.Bold,
                         fontSize = 15.sp,
                         color = MaterialTheme.colorScheme.primary
@@ -917,7 +1178,12 @@ fun LoginScreen(
                     OutlinedTextField(
                         value = usuarioRecuperar,
                         onValueChange = { usuarioRecuperar = it },
-                        label = { Text("Usuario") },
+                        label = {
+                            Text(
+                                if (loginBloqueado) "Usuario (opcional si solo desbloqueas)"
+                                else "Usuario"
+                            )
+                        },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(
                             keyboardType = KeyboardType.Text,
@@ -956,7 +1222,12 @@ fun LoginScreen(
                     OutlinedTextField(
                         value = nuevaPasswordRecuperar,
                         onValueChange = { nuevaPasswordRecuperar = it },
-                        label = { Text("Nueva Contraseña") },
+                        label = {
+                            Text(
+                                if (loginBloqueado) "Nueva Contraseña (si deseas cambiarla)"
+                                else "Nueva Contraseña"
+                            )
+                        },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(
@@ -973,7 +1244,11 @@ fun LoginScreen(
 
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "Usa la llave de recuperación entregada por el Supervisor (o su contraseña vigente). Nueva clave: 8+ caracteres, mayúscula, minúscula y número.",
+                        text = if (loginBloqueado) {
+                            "Ingresa la llave de recuperación (AG-XXXX-XXXX) o clave del Supervisor. Pulsa 'Solo Desbloquear Acceso' para habilitar el Login, o completa los 3 campos para cambiar la contraseña."
+                        } else {
+                            "Usa la llave de recuperación entregada por el Supervisor (o su contraseña vigente). Nueva clave: 8+ caracteres, mayúscula, minúscula y número."
+                        },
                         fontSize = 11.sp,
                         color = Color.Gray
                     )
@@ -1015,12 +1290,37 @@ fun LoginScreen(
                                 nuevaPasswordRecuperar = ""
                                 mensajeError = null
                                 intentosFallidos = 0
-                                segundosBloqueo = 0
+                                loginBloqueado = false
                             }
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Actualizar Contraseña")
+                        Text(
+                            if (loginBloqueado) "Actualizar Contraseña y Desbloquear"
+                            else "Actualizar Contraseña"
+                        )
+                    }
+
+                    if (loginBloqueado) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = {
+                                ocultarTeclado()
+                                val (exito, mensaje) = onDesbloquearLogin(codigoAutorizacion)
+                                recuperacionOk = exito
+                                mensajeRecuperacion = mensaje
+                                if (exito) {
+                                    password = ""
+                                    codigoAutorizacion = ""
+                                    mensajeError = null
+                                    intentosFallidos = 0
+                                    loginBloqueado = false
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Solo Desbloquear Acceso")
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(4.dp))
@@ -1152,6 +1452,15 @@ fun DashboardScreen(
     estadoConexion: String,
     enlaceActivo: Boolean,
     ipEnlazada: String?,
+    esp32Conectado: Boolean,
+    esp32Endpoint: String?,
+    estadoConexionEsp32: String,
+    ultimaTramaEsp32: String,
+    ipEsp32: String,
+    onIpEsp32Change: (String) -> Unit,
+    onConectarEsp32: () -> Unit,
+    onDesconectarEsp32: () -> Unit,
+    onPingEsp32: () -> Unit,
     ultimaTramaAES: String,
     listaEventos: List<EventoBitacora>,
     listaOperadores: List<UsuarioOperador>,
@@ -1191,6 +1500,7 @@ fun DashboardScreen(
     var mensajeRegistroOp by remember { mutableStateOf<String?>(null) }
     var registroOpOk by remember { mutableStateOf(false) }
     var mostrarConfigRed by rememberSaveable { mutableStateOf(false) }
+    var mostrarConfigEsp32 by rememberSaveable { mutableStateOf(false) }
 
     // Estados de seguridad del Supervisor (Llave de recuperación y rotación de clave propia)
     var mostrarLlaveRecuperacion by remember { mutableStateOf(false) }
@@ -1218,13 +1528,19 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         // -------------------------------------------------------------------------
-        // 0. INDICADOR VISUAL PERMANENTE DE ESTADO DE CONEXIÓN DEL SISTEMA
+        // 0. INDICADORES VISUALES DE ENLACE: CELULARES (PUERTO 5000) Y ESP32 (PUERTO 5002)
         // -------------------------------------------------------------------------
-        BarraEstadoConexionIoT(
-            enlaceActivo = enlaceActivo,
-            ipEnlazada = ipEnlazada,
-            mostrarDetalleTecnico = true
-        )
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            BarraEstadoConexionIoT(
+                enlaceActivo = enlaceActivo,
+                ipEnlazada = ipEnlazada,
+                mostrarDetalleTecnico = true
+            )
+            BarraEstadoConexionEsp32(
+                esp32Conectado = esp32Conectado,
+                esp32Endpoint = esp32Endpoint
+            )
+        }
 
         // -------------------------------------------------------------------------
         // 1. ENCABEZADO DE SESIÓN ACTIVA + CERRAR SESIÓN
@@ -1363,6 +1679,125 @@ fun DashboardScreen(
                         text = "Estado: $estadoConexion • Remoto: ${ipEnlazada ?: "En espera"}",
                         fontSize = 11.sp,
                         color = Color(0xFF475569)
+                    )
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // 2.5. CONEXIÓN HARDWARE ESP32 (PUERTO 5002 EN PARALELO AL PUERTO 5000)
+        // -------------------------------------------------------------------------
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Conexión Hardware ESP32 (Puerto ${Esp32Protocol.PUERTO_ESP32})",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = if (esp32Conectado) {
+                                "Enlazado con hardware en ${esp32Endpoint ?: ipEsp32}"
+                            } else {
+                                "Sin enlace • Escuchando en puerto ${Esp32Protocol.PUERTO_ESP32}"
+                            },
+                            fontSize = 12.sp,
+                            color = if (esp32Conectado) Color(0xFF1B5E20) else Color(0xFF475569)
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                if (esp32Conectado) onDesconectarEsp32() else onConectarEsp32()
+                            }
+                        ) {
+                            Text(if (esp32Conectado) "Desconectar" else "Conectar", fontSize = 11.sp)
+                        }
+                        TextButton(onClick = { mostrarConfigEsp32 = !mostrarConfigEsp32 }) {
+                            Text(
+                                text = if (mostrarConfigEsp32) "Ocultar" else "Configurar",
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
+
+                if (mostrarConfigEsp32) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "IP para ESP32: $ipLocal:${Esp32Protocol.PUERTO_ESP32}",
+                            fontSize = 11.sp,
+                            color = Color(0xFF475569),
+                            fontWeight = FontWeight.Medium
+                        )
+                        TextButton(onClick = onRefrescarIpLocal) {
+                            Text("Actualizar", fontSize = 11.sp)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = ipEsp32,
+                            onValueChange = onIpEsp32Change,
+                            label = { Text("IP del ESP32 (puerto ${Esp32Protocol.PUERTO_ESP32})") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Done
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onDone = { ocultarTeclado() }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .then(rememberScrollAlEnfocarModifier())
+                        )
+                        Button(onClick = {
+                            ocultarTeclado()
+                            onConectarEsp32()
+                        }) {
+                            Text("Conectar", fontSize = 11.sp)
+                        }
+                    }
+
+                    if (esp32Conectado) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = onPingEsp32,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Enviar Ping de Prueba al ESP32", fontSize = 11.sp)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Estado: $estadoConexionEsp32",
+                        fontSize = 11.sp,
+                        color = Color(0xFF475569)
+                    )
+                    Text(
+                        text = "Última trama: $ultimaTramaEsp32",
+                        fontSize = 11.sp,
+                        color = Color(0xFF64748B)
                     )
                 }
             }

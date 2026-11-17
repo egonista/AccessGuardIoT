@@ -20,6 +20,7 @@ object SecurityUtils {
     private const val TAMANO_IV_GCM = 12
     private const val TAG_GCM_BITS = 128
     private const val ALFABETO_LLAVE = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    const val MAX_INTENTOS_LOGIN = 3
 
     // Lista ampliada de credenciales de fábrica y triviales prohibidas según ISO/IEC 27400
     private val CLAVES_PROHIBIDAS = setOf(
@@ -159,6 +160,24 @@ object SecurityUtils {
     }
 
     /**
+     * Valida que el código ingresado corresponda a la llave de recuperación vigente o a la contraseña
+     * vigente del Supervisor para desbloquear un inicio de sesión bloqueado tras intentos fallidos.
+     */
+    fun validarDesbloqueoAcceso(
+        codigoAutorizacion: String,
+        codigoAutorizacionValido: Boolean = false,
+        codigoSupervisorValido: Boolean = false
+    ): String? {
+        if (codigoAutorizacion.trim().isBlank()) {
+            return "Ingresa la llave de recuperación o la contraseña del Supervisor."
+        }
+        if (!codigoAutorizacionValido && !codigoSupervisorValido) {
+            return "Código de autorización inválido. Solicita la llave vigente al Supervisor."
+        }
+        return null
+    }
+
+    /**
      * Valida el restablecimiento de contraseña desde el Login: exige la llave vigente de recuperación/autorización
      * generada por el sistema o la contraseña vigente del Supervisor (verificadas contra su hash SHA-256).
      */
@@ -175,9 +194,12 @@ object SecurityUtils {
         if (u.isBlank() || codigo.isBlank() || nuevaPassword.trim().isBlank()) {
             return "Completa usuario, código de autorización y la nueva contraseña."
         }
-        if (!codigoAutorizacionValido && !codigoSupervisorValido) {
-            return "Código de autorización inválido. Solicita la llave vigente al Supervisor."
-        }
+        val errorCodigo = validarDesbloqueoAcceso(
+            codigoAutorizacion = codigo,
+            codigoAutorizacionValido = codigoAutorizacionValido,
+            codigoSupervisorValido = codigoSupervisorValido
+        )
+        if (errorCodigo != null) return errorCodigo
         return validarPasswordRobusta(u, nuevaPassword)
     }
 
@@ -255,6 +277,8 @@ object SecurityUtils {
                 detalleLower.contains("llave de autorización") ||
                 detalleLower.contains("llave de recuperación") ||
                 detalleLower.contains("restableció") ||
+                detalleLower.contains("desbloqueó el acceso") ||
+                detalleLower.contains("acceso bloqueado") ||
                 detalleLower.contains("eliminada por el supervisor") ||
                 detalleLower.contains("clave genérica") ||
                 detalleLower.contains("credencial restringida") ||
